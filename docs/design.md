@@ -15,6 +15,8 @@ every decision is explainable and reversible where practical
 
 Alder should feel like a small dependable command-line tool, not a general workflow platform.
 
+[`organize`](https://github.com/tfeldmann/organize) is the closest prior art and should be treated as a benchmark. Alder should borrow its practical strengths — clear simulate/run behavior, conflict policy ergonomics, named regex extraction from file content, template usability, structured output, and broad fixture coverage — while staying narrower, stricter, and more explainable. See [Comparison with organize](comparison-organize.md).
+
 ## Goals
 
 - Provide a Rust-based file sorting tool with minimal runtime/environment friction.
@@ -285,7 +287,7 @@ Watchman should provide:
 
 Watchman should not be treated as the rule engine or durable state store.
 
-Watchman is the initial watcher integration, not necessarily the only possible frontend. Later versions may add a polling mode or a native watcher fallback for users who do not want to install Watchman.
+Watchman is the initial watcher integration, not necessarily the only possible frontend. Later versions may add a polling mode or a native watcher fallback for users who do not want to install Watchman. See [Watchman integration](watchman.md) for the MVP boundary and trigger sketch.
 
 ## Watchman limitations
 
