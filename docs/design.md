@@ -17,6 +17,8 @@ Alder should feel like a small dependable command-line tool, not a general workf
 
 [`organize`](https://github.com/tfeldmann/organize) is the closest prior art and should be treated as a benchmark. Alder should borrow its practical strengths — clear simulate/run behavior, conflict policy ergonomics, named regex extraction from file content, template usability, structured output, and broad fixture coverage — while staying narrower, stricter, and more explainable. See [Comparison with organize](comparison-organize.md).
 
+Alder should continue moving toward stronger semantic types for facts, paths, and template values as the prototype matures. See [Semantic type assessment](semantic-types.md).
+
 ## Goals
 
 - Provide a Rust-based file sorting tool with minimal runtime/environment friction.
