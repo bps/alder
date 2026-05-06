@@ -26,7 +26,7 @@ watchman watch-project ~/Downloads
 watchman query ~/Downloads --since c:0 --fields name type exists --expression '["allof", ["type", "f"], ["suffix", "pdf"]]'
 ```
 
-The result can be transformed into an `alder ingest` call by a small wrapper script once the CLI is wired to the planner:
+The result can be transformed into an `alder ingest` call once the CLI is wired to the planner:
 
 ```sh
 alder ingest ~/Downloads/foo.pdf ~/Downloads/bar.pdf --dry-run
@@ -34,22 +34,79 @@ alder ingest ~/Downloads/foo.pdf ~/Downloads/bar.pdf --dry-run
 
 Until then, `alder run ~/Downloads --dry-run` remains the intended human-facing command shape.
 
-## Trigger sketch
+## Alder-managed triggers
 
-A Watchman trigger can invoke Alder for changed PDFs under `~/Downloads`:
+The preferred workflow is for Alder to generate and synchronize Watchman trigger definitions directly from `alder.yaml`, avoiding a shell wrapper.
+
+Expected commands:
 
 ```sh
-watchman -- trigger ~/Downloads alder-pdf-sort '**/*.pdf' -- alder ingest --dry-run
+# Print generated trigger JSON without changing Watchman state.
+alder watchman print --config ~/src/alder/tmp/alder.yaml
+
+# Register or update Alder-owned watches and triggers.
+alder watchman sync --config ~/src/alder/tmp/alder.yaml
+
+# Verify that Watchman state matches config-derived trigger definitions.
+alder watchman check --config ~/src/alder/tmp/alder.yaml
+
+# Remove Alder-owned triggers.
+alder watchman unsync --config ~/src/alder/tmp/alder.yaml
 ```
 
-A production trigger should prefer a wrapper script so it can:
+For a watch path such as `~/src/alder/tmp/inbox`, Alder should register an extended Watchman trigger roughly like this:
 
-- receive the Watchman file list on stdin;
+```json
+[
+  "trigger",
+  "/Users/example/src/alder/tmp/inbox",
+  {
+    "name": "alder",
+    "expression": [
+      "allof",
+      ["type", "f"],
+      ["suffix", "pdf"],
+      [
+        "not",
+        [
+          "anyof",
+          ["match", "*.download", "wholename"],
+          ["match", "*.crdownload", "wholename"],
+          ["match", "*.part", "wholename"],
+          ["match", "*.tmp", "wholename"]
+        ]
+      ]
+    ],
+    "command": [
+      "/path/to/alder",
+      "ingest",
+      "--from-watchman",
+      "--config",
+      "/Users/example/src/alder/tmp/alder.yaml"
+    ],
+    "append_files": false,
+    "stdin": ["name", "exists", "type"]
+  }
+]
+```
+
+This avoids shell expansion and command-line length issues. Watchman sends structured JSON on stdin, and Alder resolves each relative `name` using `WATCHMAN_ROOT`.
+
+`alder ingest --from-watchman` should:
+
+- read Watchman JSON from stdin;
+- require `WATCHMAN_ROOT`;
 - convert relative names to absolute paths;
-- drop deleted files and directories;
-- ignore temporary download suffixes;
-- batch paths into one Alder invocation;
-- capture stdout/stderr for debugging.
+- discard deleted entries and non-files;
+- re-apply Alder's own include and ignore rules;
+- stabilize candidates;
+- run the normal ingest pipeline.
+
+If `watch.ignore` changes in `alder.yaml`, a later `alder watchman sync` should update the Watchman trigger expression so the Watchman prefilter stays in sync with Alder's internal filtering.
+
+## Wrapper fallback
+
+A shell wrapper remains a useful fallback for early experiments or unusual environments, but it should not be required for the normal workflow.
 
 Example wrapper shape:
 
@@ -116,7 +173,7 @@ If Watchman reports the same file multiple times, Alder should avoid concurrent 
 For the MVP, keep the boundary simple:
 
 1. Watchman watches `~/Downloads` and reports candidate paths.
-2. A wrapper invokes `alder ingest PATH... --dry-run` or `alder ingest PATH...`.
+2. Alder-managed Watchman triggers invoke `alder ingest --from-watchman` directly.
 3. Alder stabilizes candidates.
 4. Alder produces facts and evaluates rules.
 5. Alder produces an action plan.

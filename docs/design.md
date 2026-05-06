@@ -98,6 +98,10 @@ The watcher detects candidates. Alder owns the semantics.
 alder run ~/Downloads --dry-run
 alder ingest ~/Downloads/foo.pdf ~/Downloads/bar.pdf
 alder watch
+alder watchman print
+alder watchman sync
+alder watchman check
+alder watchman unsync
 alder facts ~/Downloads/foo.pdf
 alder explain ~/Downloads/foo.pdf
 alder test
@@ -288,6 +292,68 @@ Watchman should provide:
 Watchman should not be treated as the rule engine or durable state store.
 
 Watchman is the initial watcher integration, not necessarily the only possible frontend. Later versions may add a polling mode or a native watcher fallback for users who do not want to install Watchman. See [Watchman integration](watchman.md) for the MVP boundary and trigger sketch.
+
+### Alder-managed Watchman sync
+
+Alder should avoid requiring users to maintain a shell wrapper around Watchman triggers.
+
+Instead, Alder should be able to generate and synchronize Watchman trigger definitions from the same `watch.include`, `watch.ignore`, and `watch.paths` config that Alder uses internally:
+
+```sh
+alder watchman print --config alder.yaml
+alder watchman sync --config alder.yaml
+alder watchman check --config alder.yaml
+alder watchman unsync --config alder.yaml
+```
+
+The generated trigger should invoke Alder directly and pass changed files over structured stdin rather than through shell argument expansion:
+
+```json
+[
+  "trigger",
+  "/Users/example/Downloads",
+  {
+    "name": "alder",
+    "expression": [
+      "allof",
+      ["type", "f"],
+      ["suffix", "pdf"],
+      [
+        "not",
+        [
+          "anyof",
+          ["match", "*.download", "wholename"],
+          ["match", "*.crdownload", "wholename"],
+          ["match", "*.part", "wholename"],
+          ["match", "*.tmp", "wholename"]
+        ]
+      ]
+    ],
+    "command": [
+      "/path/to/alder",
+      "ingest",
+      "--from-watchman",
+      "--config",
+      "/path/to/alder.yaml"
+    ],
+    "append_files": false,
+    "stdin": ["name", "exists", "type"]
+  }
+]
+```
+
+`alder ingest --from-watchman` should:
+
+- read Watchman JSON from stdin;
+- use `WATCHMAN_ROOT` to resolve relative file names;
+- drop deleted entries and non-files;
+- re-apply Alder's include and ignore filters internally;
+- stabilize remaining candidates;
+- then run the normal ingest pipeline.
+
+The Watchman expression is only a cheap prefilter. It is not a trusted security boundary. Alder must still enforce include/ignore rules, source safety, destination-root checks, conflict policy, and action logging.
+
+Writing `.watchmanconfig` should be optional and explicit because it modifies user directories. The default `watchman sync` behavior should register or update Alder-owned triggers through Watchman's API without writing files into watched roots.
 
 ## Watchman limitations
 
