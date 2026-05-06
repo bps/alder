@@ -172,7 +172,7 @@ If Watchman reports the same file multiple times, Alder should avoid concurrent 
 
 For the MVP, keep the boundary simple:
 
-1. Watchman watches `~/Downloads` and reports candidate paths.
+1. `alder watchman sync` asks Watchman to watch each configured `watch.paths` directory directly.
 2. Alder-managed Watchman triggers invoke `alder ingest --from-watchman` directly.
 3. Alder stabilizes candidates.
 4. Alder produces facts and evaluates rules.

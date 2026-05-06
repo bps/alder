@@ -283,7 +283,7 @@ This is likely the best long-term model.
 
 Watchman should provide:
 
-- Efficient recursive watching
+- Efficient recursive watching of configured `watch.paths` directories
 - Candidate prefiltering, e.g. PDFs under `~/Downloads`
 - Event batching
 - Settling/debounce where useful

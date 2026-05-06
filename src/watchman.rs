@@ -374,7 +374,7 @@ pub fn watchman_sync(
 ) -> Result<(), WatchmanError> {
     for command in generate_trigger_commands(config, options)? {
         run_watchman_json(&[
-            Value::String("watch-project".to_string()),
+            Value::String("watch".to_string()),
             path_value(command.root()),
         ])?;
         run_watchman_json(&serde_json::to_value(&command).map_err(WatchmanError::JsonShape)?)?;
