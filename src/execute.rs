@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::ConflictPolicy;
 use crate::facts::file::{FileFactError, FileFacts};
@@ -39,7 +39,7 @@ pub struct ExecutionRecord {
     pub size: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionStatus {
     Planned,
@@ -47,12 +47,17 @@ pub enum ExecutionStatus {
     Moved,
     Skipped,
     Failed,
+    Undone,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ActionLogRecord {
     schema_version: u32,
     ts_unix_ms: u128,
+    #[serde(default)]
+    action_id: String,
+    #[serde(default)]
+    undoes_action_id: Option<String>,
     run_id: String,
     rule_id: String,
     action: String,
@@ -169,9 +174,13 @@ fn execute_move(
 
     let sha256 = source_facts.sha256()?.to_string();
     let size = source_facts.size();
+    let action_id = new_action_id(&options.run_id, &source, &destination);
     let intent = ActionLogRecord::new(
+        action_id.clone(),
+        None,
         &options.run_id,
         &plan.rule_id,
+        "move",
         ExecutionStatus::InProgress,
         &source,
         &destination,
@@ -190,8 +199,11 @@ fn execute_move(
     move_without_overwrite(&source, &destination)?;
 
     let committed = ActionLogRecord::new(
+        action_id,
+        None,
         &options.run_id,
         &plan.rule_id,
+        "move",
         ExecutionStatus::Moved,
         &source,
         &destination,
@@ -379,7 +391,29 @@ impl ActionLog {
         Ok(Self { file })
     }
 
+    fn read_records(&mut self) -> Result<Vec<ActionLogRecord>, ExecuteError> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| ExecuteError::io("seek action log", "action log", error))?;
+        let mut input = String::new();
+        self.file
+            .read_to_string(&mut input)
+            .map_err(|error| ExecuteError::io("read action log", "action log", error))?;
+        input
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).map_err(ExecuteError::SerializeLog))
+            .collect()
+    }
+
     fn append(&mut self, record: &ActionLogRecord) -> Result<(), ExecuteError> {
+        use std::io::{Seek, SeekFrom};
+
+        self.file
+            .seek(SeekFrom::End(0))
+            .map_err(|error| ExecuteError::io("seek action log end", "action log", error))?;
         serde_json::to_writer(&mut self.file, record).map_err(ExecuteError::SerializeLog)?;
         self.file
             .write_all(b"\n")
@@ -397,10 +431,154 @@ impl Drop for ActionLog {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UndoReport {
+    pub undone_action_id: String,
+    pub restored_from: PathBuf,
+    pub restored_to: PathBuf,
+    pub status: ExecutionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReconcileFinding {
+    pub action_id: String,
+    pub action: String,
+    pub from: PathBuf,
+    pub to: PathBuf,
+    pub status: ExecutionStatus,
+    pub message: String,
+}
+
+pub fn undo_last_move(action_log_path: &Path) -> Result<UndoReport, ExecuteError> {
+    let mut log = ActionLog::open(action_log_path)?;
+    let records = log.read_records()?;
+    let record = latest_unundone_move(&records).ok_or(ExecuteError::NothingToUndo)?;
+
+    if record.sha256.is_none() || record.size.is_none() {
+        return Err(ExecuteError::UndoRefused(
+            "move record lacks hash or size; refusing undo".to_string(),
+        ));
+    }
+    if record.from.exists() {
+        return Err(ExecuteError::UndoRefused(format!(
+            "source path already exists: {}",
+            record.from.display()
+        )));
+    }
+    reject_unsafe_source(&record.to)?;
+    let destination_facts = FileFacts::from_path(&record.to)?;
+    if Some(destination_facts.size()) != record.size {
+        return Err(ExecuteError::UndoRefused(
+            "destination size no longer matches action log".to_string(),
+        ));
+    }
+    if Some(destination_facts.sha256()?.to_string()) != record.sha256 {
+        return Err(ExecuteError::UndoRefused(
+            "destination hash no longer matches action log".to_string(),
+        ));
+    }
+
+    if let Some(parent) = record.from.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| ExecuteError::io("create undo destination parent", parent, error))?;
+    }
+
+    let undo_action_id = new_action_id(&record.run_id, &record.to, &record.from);
+    let intent = ActionLogRecord::new(
+        undo_action_id.clone(),
+        Some(record.action_id.clone()),
+        &record.run_id,
+        &record.rule_id,
+        "undo_move",
+        ExecutionStatus::InProgress,
+        &record.to,
+        &record.from,
+        record.sha256.clone(),
+        record.size,
+        Some("undo move".to_string()),
+    );
+    log.append(&intent)?;
+
+    move_without_overwrite(&record.to, &record.from)?;
+
+    let undone = ActionLogRecord::new(
+        undo_action_id,
+        Some(record.action_id.clone()),
+        &record.run_id,
+        &record.rule_id,
+        "undo_move",
+        ExecutionStatus::Undone,
+        &record.to,
+        &record.from,
+        record.sha256.clone(),
+        record.size,
+        Some("undo move".to_string()),
+    );
+    log.append(&undone)?;
+
+    Ok(UndoReport {
+        undone_action_id: record.action_id,
+        restored_from: record.to,
+        restored_to: record.from,
+        status: ExecutionStatus::Undone,
+    })
+}
+
+pub fn reconcile_action_log(action_log_path: &Path) -> Result<Vec<ReconcileFinding>, ExecuteError> {
+    let mut log = ActionLog::open(action_log_path)?;
+    let records = log.read_records()?;
+    Ok(reconcile_records(&records))
+}
+
+fn latest_unundone_move(records: &[ActionLogRecord]) -> Option<ActionLogRecord> {
+    let undone: std::collections::HashSet<&str> = records
+        .iter()
+        .filter(|record| record.action == "undo_move" && record.status == ExecutionStatus::Undone)
+        .filter_map(|record| record.undoes_action_id.as_deref())
+        .collect();
+
+    records
+        .iter()
+        .rev()
+        .find(|record| {
+            record.action == "move"
+                && record.status == ExecutionStatus::Moved
+                && !undone.contains(record.action_id.as_str())
+        })
+        .cloned()
+}
+
+fn reconcile_records(records: &[ActionLogRecord]) -> Vec<ReconcileFinding> {
+    records
+        .iter()
+        .filter(|record| record.status == ExecutionStatus::InProgress)
+        .filter(|record| {
+            !records.iter().any(|later| {
+                later.action_id == record.action_id
+                    && matches!(
+                        later.status,
+                        ExecutionStatus::Moved | ExecutionStatus::Failed | ExecutionStatus::Undone
+                    )
+            })
+        })
+        .map(|record| ReconcileFinding {
+            action_id: record.action_id.clone(),
+            action: record.action.clone(),
+            from: record.from.clone(),
+            to: record.to.clone(),
+            status: record.status.clone(),
+            message: "in-progress action has no terminal record".to_string(),
+        })
+        .collect()
+}
+
 impl ActionLogRecord {
     fn new(
+        action_id: String,
+        undoes_action_id: Option<String>,
         run_id: &str,
         rule_id: &str,
+        action: &str,
         status: ExecutionStatus,
         from: &Path,
         to: &Path,
@@ -414,9 +592,11 @@ impl ActionLogRecord {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis(),
+            action_id,
+            undoes_action_id,
             run_id: run_id.to_string(),
             rule_id: rule_id.to_string(),
-            action: "move".to_string(),
+            action: action.to_string(),
             status,
             from: from.to_path_buf(),
             to: to.to_path_buf(),
@@ -425,6 +605,14 @@ impl ActionLogRecord {
             reason,
         }
     }
+}
+
+fn new_action_id(run_id: &str, from: &Path, to: &Path) -> String {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{run_id}:{ts}:{}:{}", from.display(), to.display())
 }
 
 #[derive(Debug)]
@@ -442,6 +630,8 @@ pub enum ExecuteError {
     DestinationExists(PathBuf),
     ConflictExhausted(PathBuf),
     UnsupportedConflict(ConflictPolicy),
+    NothingToUndo,
+    UndoRefused(String),
     FileFact(FileFactError),
     Io {
         op: &'static str,
@@ -510,6 +700,8 @@ impl fmt::Display for ExecuteError {
                 f,
                 "conflict policy {policy:?} is not supported by execution yet"
             ),
+            Self::NothingToUndo => write!(f, "nothing to undo"),
+            Self::UndoRefused(message) => write!(f, "undo refused: {message}"),
             Self::FileFact(error) => write!(f, "{error}"),
             Self::Io { op, path, source } => {
                 write!(f, "failed to {op} for {}: {source}", path.display())
@@ -682,6 +874,77 @@ mod tests {
 
         assert!(matches!(error, ExecuteError::UnsafeSource(_)));
         assert!(source.exists());
+    }
+
+    #[test]
+    fn undo_last_move_restores_source_and_logs_undo() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.pdf");
+        let dest_root = temp_dir.path().join("dest");
+        fs::create_dir(&dest_root).unwrap();
+        let dest = dest_root.join("source.pdf");
+        fs::write(&source, b"abc").unwrap();
+        let log = temp_dir.path().join("actions.jsonl");
+        let plan = plan(&source, &dest, ConflictPolicy::Error);
+        execute_plan(&plan, &options(false, &dest_root, &log)).unwrap();
+
+        let report = undo_last_move(&log).unwrap();
+
+        assert_eq!(report.status, ExecutionStatus::Undone);
+        assert!(source.exists());
+        assert!(!dest.exists());
+        assert_eq!(fs::read(&source).unwrap(), b"abc");
+        let log_text = fs::read_to_string(log).unwrap();
+        assert!(log_text.contains(r#""action":"undo_move""#));
+        assert!(log_text.contains(r#""status":"undone""#));
+    }
+
+    #[test]
+    fn undo_refuses_modified_destination() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.pdf");
+        let dest_root = temp_dir.path().join("dest");
+        fs::create_dir(&dest_root).unwrap();
+        let dest = dest_root.join("source.pdf");
+        fs::write(&source, b"abc").unwrap();
+        let log = temp_dir.path().join("actions.jsonl");
+        let plan = plan(&source, &dest, ConflictPolicy::Error);
+        execute_plan(&plan, &options(false, &dest_root, &log)).unwrap();
+        fs::write(&dest, b"changed").unwrap();
+
+        let error = undo_last_move(&log).unwrap_err();
+
+        assert!(matches!(error, ExecuteError::UndoRefused(_)));
+        assert!(dest.exists());
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn reconcile_reports_orphan_in_progress_records() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let log = temp_dir.path().join("actions.jsonl");
+        let record = ActionLogRecord::new(
+            "action-1".to_string(),
+            None,
+            "run",
+            "rule",
+            "move",
+            ExecutionStatus::InProgress,
+            Path::new("/from"),
+            Path::new("/to"),
+            None,
+            None,
+            None,
+        );
+        {
+            let mut action_log = ActionLog::open(&log).unwrap();
+            action_log.append(&record).unwrap();
+        }
+
+        let findings = reconcile_action_log(&log).unwrap();
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].action_id, "action-1");
     }
 
     fn plan(source: &Path, destination: &Path, conflict: ConflictPolicy) -> ActionPlan {

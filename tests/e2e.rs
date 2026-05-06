@@ -123,10 +123,43 @@ fn run_moves_and_logs() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(!source.exists());
-    assert_eq!(fs::read(sandbox.sorted.join("statement.pdf")).unwrap(), b"fake pdf");
+    assert_eq!(
+        fs::read(sandbox.sorted.join("statement.pdf")).unwrap(),
+        b"fake pdf"
+    );
     let log = fs::read_to_string(sandbox.action_log()).unwrap();
     assert!(log.contains(r#""status":"in_progress""#));
     assert!(log.contains(r#""status":"moved""#));
+}
+
+#[test]
+fn undo_last_restores_last_move() {
+    let sandbox = Sandbox::new();
+    let source = sandbox.write_inbox("statement.pdf", b"fake pdf");
+    let dest = sandbox.sorted.join("statement.pdf");
+    let run_output = sandbox
+        .command()
+        .arg("run")
+        .arg(&sandbox.inbox)
+        .output()
+        .unwrap();
+    assert!(run_output.status.success(), "{}", stderr(&run_output));
+
+    let undo_output = sandbox
+        .command()
+        .arg("--json")
+        .arg("undo")
+        .output()
+        .unwrap();
+
+    assert!(undo_output.status.success(), "{}", stderr(&undo_output));
+    assert!(source.exists());
+    assert!(!dest.exists());
+    assert_eq!(fs::read(&source).unwrap(), b"fake pdf");
+    let json: Value = serde_json::from_slice(&undo_output.stdout).unwrap();
+    assert_eq!(json["status"], "undone");
+    let log = fs::read_to_string(sandbox.action_log()).unwrap();
+    assert!(log.contains(r#""action":"undo_move""#));
 }
 
 #[test]
@@ -145,12 +178,20 @@ fn facts_json_exposes_provider_reports() {
     assert!(output.status.success(), "{}", stderr(&output));
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["facts"]["file.name"]["value"], "statement.pdf");
-    assert!(json["provider_reports"].as_array().unwrap().iter().any(|report| {
-        report["provider"] == "file" && report["status"] == "invoked"
-    }));
-    assert!(json["provider_reports"].as_array().unwrap().iter().any(|report| {
-        report["provider"] == "pdf" && report["status"] == "not_required"
-    }));
+    assert!(
+        json["provider_reports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|report| { report["provider"] == "file" && report["status"] == "invoked" })
+    );
+    assert!(
+        json["provider_reports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|report| { report["provider"] == "pdf" && report["status"] == "not_required" })
+    );
 }
 
 #[test]
@@ -168,27 +209,52 @@ fn explain_json_includes_matched_rule_and_destination() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["explanation"]["rule_evaluations"][0]["rule_id"], "pdfs");
+    assert_eq!(
+        json["explanation"]["rule_evaluations"][0]["rule_id"],
+        "pdfs"
+    );
     assert_eq!(json["explanation"]["rule_evaluations"][0]["matched"], true);
-    assert!(json["explanation"]["plan"]["actions"][0]["to"]
-        .as_str()
-        .unwrap()
-        .ends_with("sorted/statement.pdf"));
+    assert!(
+        json["explanation"]["plan"]["actions"][0]["to"]
+            .as_str()
+            .unwrap()
+            .ends_with("sorted/statement.pdf")
+    );
 }
 
 #[test]
 fn watchman_print_generates_direct_alder_trigger() {
     let sandbox = Sandbox::new();
 
-    let output = sandbox.command().arg("watchman").arg("print").output().unwrap();
+    let output = sandbox
+        .command()
+        .arg("watchman")
+        .arg("print")
+        .output()
+        .unwrap();
 
     assert!(output.status.success(), "{}", stderr(&output));
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     let trigger = &json[0][2];
     assert_eq!(trigger["append_files"], false);
-    assert_eq!(trigger["stdin"], serde_json::json!(["name", "exists", "type"]));
-    assert!(trigger["command"].as_array().unwrap().iter().any(|part| part == "ingest"));
-    assert!(trigger["command"].as_array().unwrap().iter().any(|part| part == "--from-watchman"));
+    assert_eq!(
+        trigger["stdin"],
+        serde_json::json!(["name", "exists", "type"])
+    );
+    assert!(
+        trigger["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|part| part == "ingest")
+    );
+    assert!(
+        trigger["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|part| part == "--from-watchman")
+    );
     assert!(trigger["expression"].to_string().contains("pdf"));
     assert!(trigger["expression"].to_string().contains("tmp"));
 }

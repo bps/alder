@@ -7,6 +7,7 @@ use clap::CommandFactory;
 use clap::{Args, Parser, Subcommand};
 
 use alder::config::parse_config_str;
+use alder::execute::undo_last_move;
 use alder::pipeline::{
     ProcessOptions, destination_roots, explain_file, facts_for_file, process_paths,
 };
@@ -153,14 +154,7 @@ fn run(cli: Cli) -> ExitCode {
             "test",
             format!("would run fixture tests with config={config_hint}"),
         ),
-        Command::Undo(args) => stub(
-            cli.json,
-            "undo",
-            format!(
-                "would undo {}",
-                args.target.as_deref().unwrap_or("last logged action")
-            ),
-        ),
+        Command::Undo(args) => run_undo(cli.json, args),
         Command::Watch => stub(
             cli.json,
             "watch",
@@ -299,6 +293,27 @@ fn run_explain(config_path: Option<&PathBuf>, json: bool, args: FileOutputArgs) 
     } else {
         print_human_result(&result);
         exit_for_results(std::slice::from_ref(&result))
+    }
+}
+
+fn run_undo(json: bool, args: UndoArgs) -> ExitCode {
+    if !matches!(args.target.as_deref(), None | Some("last")) {
+        return error_exit(
+            "only `alder undo` and `alder undo last` are supported for now".to_string(),
+        );
+    }
+
+    match undo_last_move(&default_action_log_path()) {
+        Ok(report) if json => print_json(&report),
+        Ok(report) => {
+            println!(
+                "Undid move: {} -> {}",
+                report.restored_from.display(),
+                report.restored_to.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => error_exit(error.to_string()),
     }
 }
 
