@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,9 +8,10 @@ use serde::Serialize;
 
 use crate::config::Config;
 use crate::execute::{ExecuteOptions, ExecutionReport, execute_plan};
-use crate::expr::Value;
+use crate::expr::{self, Value};
 use crate::facts::file::FileFacts;
 use crate::facts::pdf::PdfTextProvider;
+use crate::facts::spotlight::SpotlightProvider;
 use crate::planning::{Explanation, plan_for_file};
 
 #[derive(Debug, Clone, Serialize)]
@@ -24,6 +26,7 @@ pub struct ProcessOptions {
 pub struct PipelineResult {
     pub source: PathBuf,
     pub provider_errors: Vec<String>,
+    pub provider_reports: Vec<ProviderReport>,
     pub explanation: Option<Explanation>,
     pub execution: Option<ExecutionReport>,
     pub error: Option<String>,
@@ -34,6 +37,37 @@ pub struct FactsOutput {
     pub source: PathBuf,
     pub facts: IndexMap<String, Value>,
     pub provider_errors: Vec<String>,
+    pub provider_reports: Vec<ProviderReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderReport {
+    pub provider: FactProvider,
+    pub status: ProviderStatus,
+    pub facts: Vec<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactProvider {
+    File,
+    Pdf,
+    Spotlight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderStatus {
+    NotRequired,
+    Skipped,
+    Invoked,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequiredFacts {
+    pub keys: BTreeSet<String>,
 }
 
 pub fn process_paths(
@@ -54,6 +88,7 @@ pub fn explain_file(config: &Config, path: impl AsRef<Path>) -> PipelineResult {
         Ok(explanation) => PipelineResult {
             source,
             provider_errors: facts_output.provider_errors,
+            provider_reports: facts_output.provider_reports,
             explanation: Some(explanation),
             execution: None,
             error: None,
@@ -61,6 +96,7 @@ pub fn explain_file(config: &Config, path: impl AsRef<Path>) -> PipelineResult {
         Err(error) => PipelineResult {
             source,
             provider_errors: facts_output.provider_errors,
+            provider_reports: facts_output.provider_reports,
             explanation: None,
             execution: None,
             error: Some(error.to_string()),
@@ -72,6 +108,8 @@ pub fn facts_for_file(config: &Config, path: impl AsRef<Path>) -> FactsOutput {
     let source = path.as_ref().to_path_buf();
     let mut facts = IndexMap::new();
     let mut provider_errors = Vec::new();
+    let mut provider_reports = Vec::new();
+    let required = required_facts(config);
 
     match FileFacts::from_path(&source) {
         Ok(file) => {
@@ -107,23 +145,112 @@ pub fn facts_for_file(config: &Config, path: impl AsRef<Path>) -> FactsOutput {
                     Value::String(system_time_string(created)),
                 );
             }
+            provider_reports.push(ProviderReport {
+                provider: FactProvider::File,
+                status: ProviderStatus::Invoked,
+                facts: facts
+                    .keys()
+                    .filter(|key| key.starts_with("file."))
+                    .cloned()
+                    .collect(),
+                message: None,
+            });
 
-            if needs_pdf_text(config) && file.ext().eq_ignore_ascii_case(".pdf") {
+            if required.needs_provider("pdf") && file.ext().eq_ignore_ascii_case(".pdf") {
                 match PdfTextProvider::default().text(file.path()) {
                     Ok(text) => {
                         facts.insert("pdf.text".to_string(), Value::String(text));
+                        provider_reports.push(ProviderReport {
+                            provider: FactProvider::Pdf,
+                            status: ProviderStatus::Invoked,
+                            facts: vec!["pdf.text".to_string()],
+                            message: None,
+                        });
                     }
-                    Err(error) => provider_errors.push(format!("pdf.text: {error}")),
+                    Err(error) => {
+                        let message = format!("pdf.text: {error}");
+                        provider_errors.push(message.clone());
+                        provider_reports.push(ProviderReport {
+                            provider: FactProvider::Pdf,
+                            status: ProviderStatus::Error,
+                            facts: vec!["pdf.text".to_string()],
+                            message: Some(message),
+                        });
+                    }
                 }
+            } else if required.needs_provider("pdf") {
+                provider_reports.push(ProviderReport {
+                    provider: FactProvider::Pdf,
+                    status: ProviderStatus::Skipped,
+                    facts: vec!["pdf.text".to_string()],
+                    message: Some("source is not a PDF".to_string()),
+                });
+            } else {
+                provider_reports.push(ProviderReport {
+                    provider: FactProvider::Pdf,
+                    status: ProviderStatus::NotRequired,
+                    facts: Vec::new(),
+                    message: None,
+                });
+            }
+
+            if required.needs_provider("spotlight") {
+                match SpotlightProvider::default().facts(file.path()) {
+                    Ok(spotlight_facts) => {
+                        let mut produced = Vec::new();
+                        for (key, value) in spotlight_facts {
+                            produced.push(key.clone());
+                            facts.insert(key, Value::String(spotlight_value_string(&value)));
+                        }
+                        provider_reports.push(ProviderReport {
+                            provider: FactProvider::Spotlight,
+                            status: ProviderStatus::Invoked,
+                            facts: produced,
+                            message: None,
+                        });
+                    }
+                    Err(error) => {
+                        let message = format!("spotlight: {error}");
+                        provider_errors.push(message.clone());
+                        provider_reports.push(ProviderReport {
+                            provider: FactProvider::Spotlight,
+                            status: ProviderStatus::Error,
+                            facts: required
+                                .keys
+                                .iter()
+                                .filter(|key| key.starts_with("spotlight."))
+                                .cloned()
+                                .collect(),
+                            message: Some(message),
+                        });
+                    }
+                }
+            } else {
+                provider_reports.push(ProviderReport {
+                    provider: FactProvider::Spotlight,
+                    status: ProviderStatus::NotRequired,
+                    facts: Vec::new(),
+                    message: None,
+                });
             }
         }
-        Err(error) => provider_errors.push(error.to_string()),
+        Err(error) => {
+            let message = error.to_string();
+            provider_errors.push(message.clone());
+            provider_reports.push(ProviderReport {
+                provider: FactProvider::File,
+                status: ProviderStatus::Error,
+                facts: Vec::new(),
+                message: Some(message),
+            });
+        }
     }
 
     FactsOutput {
         source,
         facts,
         provider_errors,
+        provider_reports,
     }
 }
 
@@ -145,6 +272,7 @@ fn process_file(config: &Config, source: PathBuf, options: &ProcessOptions) -> P
             return PipelineResult {
                 source,
                 provider_errors: facts_output.provider_errors,
+                provider_reports: facts_output.provider_reports,
                 explanation: None,
                 execution: None,
                 error: Some(error.to_string()),
@@ -165,6 +293,7 @@ fn process_file(config: &Config, source: PathBuf, options: &ProcessOptions) -> P
                 return PipelineResult {
                     source,
                     provider_errors: facts_output.provider_errors,
+                    provider_reports: facts_output.provider_reports,
                     explanation: Some(explanation),
                     execution: None,
                     error: Some(error.to_string()),
@@ -178,6 +307,7 @@ fn process_file(config: &Config, source: PathBuf, options: &ProcessOptions) -> P
     PipelineResult {
         source,
         provider_errors: facts_output.provider_errors,
+        provider_reports: facts_output.provider_reports,
         explanation: Some(explanation),
         execution,
         error: None,
@@ -217,14 +347,41 @@ fn collect_path(path: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn needs_pdf_text(config: &Config) -> bool {
-    config.rules.iter().any(|rule| {
-        rule.when.contains("pdf.text")
-            || rule
-                .extract
-                .values()
-                .any(|extractor| extractor.from == "pdf.text")
-    })
+pub fn required_facts(config: &Config) -> RequiredFacts {
+    let mut keys = BTreeSet::new();
+
+    for rule in &config.rules {
+        if let Ok(identifiers) = expr::identifiers(&rule.when) {
+            keys.extend(identifiers);
+        }
+        for extractor in rule.extract.values() {
+            keys.insert(extractor.from.clone());
+        }
+    }
+
+    RequiredFacts { keys }
+}
+
+impl RequiredFacts {
+    fn needs_provider(&self, provider: &str) -> bool {
+        let prefix = format!("{provider}.");
+        self.keys.iter().any(|key| key.starts_with(&prefix))
+    }
+}
+
+fn spotlight_value_string(value: &plist::Value) -> String {
+    match value {
+        plist::Value::String(value) => value.clone(),
+        plist::Value::Boolean(value) => value.to_string(),
+        plist::Value::Integer(value) => value.to_string(),
+        plist::Value::Real(value) => value.to_string(),
+        plist::Value::Array(values) => values
+            .iter()
+            .map(spotlight_value_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => format!("{other:?}"),
+    }
 }
 
 fn system_time_string(time: SystemTime) -> String {
@@ -320,6 +477,46 @@ mod tests {
                 .unwrap()
                 .contains("moved")
         );
+    }
+
+    #[test]
+    fn required_facts_include_expression_and_extractors() {
+        let config = parse_config_str(
+            r#"
+version: 1
+rules:
+  - id: amex
+    when: file.ext == ".pdf" && contains(pdf.text, "American Express")
+    extract:
+      author:
+        from: spotlight.kMDItemAuthors
+        regex: "(.*)"
+    actions:
+      - move:
+          to: "~/Documents/{{ file.name }}"
+"#,
+        )
+        .unwrap();
+
+        let required = required_facts(&config);
+
+        assert!(required.keys.contains("file.ext"));
+        assert!(required.keys.contains("pdf.text"));
+        assert!(required.keys.contains("spotlight.kMDItemAuthors"));
+    }
+
+    #[test]
+    fn provider_reports_mark_pdf_not_required() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("statement.pdf");
+        fs::write(&file, b"fake").unwrap();
+        let config = config(temp.path());
+
+        let facts = facts_for_file(&config, &file);
+
+        assert!(facts.provider_reports.iter().any(|report| {
+            report.provider == FactProvider::Pdf && report.status == ProviderStatus::NotRequired
+        }));
     }
 
     fn config(sorted: &Path) -> Config {

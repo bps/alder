@@ -27,6 +27,15 @@ pub fn eval_bool(expr: &str, facts: &IndexMap<String, Value>) -> Result<bool, Ex
     }
 }
 
+pub fn identifiers(expr: &str) -> Result<Vec<String>, ExprError> {
+    let ast = parse(expr)?;
+    let mut identifiers = Vec::new();
+    ast.collect_identifiers(&mut identifiers);
+    identifiers.sort();
+    identifiers.dedup();
+    Ok(identifiers)
+}
+
 fn parse(input: &str) -> Result<Expr, ExprError> {
     let tokens = Lexer::new(input).tokenize()?;
     let mut parser = Parser { tokens, pos: 0 };
@@ -51,6 +60,22 @@ enum Expr {
 }
 
 impl Expr {
+    fn collect_identifiers(&self, out: &mut Vec<String>) {
+        match self {
+            Self::Literal(_) => {}
+            Self::Identifier(name) => out.push(name.clone()),
+            Self::Call { args, .. } => {
+                for arg in args {
+                    arg.collect_identifiers(out);
+                }
+            }
+            Self::Binary { left, right, .. } => {
+                left.collect_identifiers(out);
+                right.collect_identifiers(out);
+            }
+        }
+    }
+
     fn eval(&self, facts: &IndexMap<String, Value>) -> Result<Value, ExprError> {
         match self {
             Self::Literal(value) => Ok(value.clone()),
@@ -611,6 +636,14 @@ mod tests {
         let error = eval_bool("starts_with(pdf.text, \"t\")", &facts).unwrap_err();
 
         assert_eq!(error, ExprError::UnknownFunction("starts_with".to_string()));
+    }
+
+    #[test]
+    fn extracts_identifiers_from_expression() {
+        let ids =
+            identifiers(r#"file.ext == ".pdf" && contains(pdf.text, "American Express")"#).unwrap();
+
+        assert_eq!(ids, vec!["file.ext".to_string(), "pdf.text".to_string()]);
     }
 
     fn facts<const N: usize>(items: [(&str, Value); N]) -> IndexMap<String, Value> {
