@@ -1,8 +1,8 @@
 use std::collections::HashSet;
-use std::fmt;
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize};
+use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -174,27 +174,12 @@ pub struct MoveToReviewAction {
     pub conflict: Option<ConflictPolicy>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ConfigError {
-    Parse(serde_yaml::Error),
+    #[error("failed to parse config: {0}")]
+    Parse(#[from] serde_yaml::Error),
+    #[error("invalid config: {}", .0.join("; "))]
     Invalid(Vec<String>),
-}
-
-impl fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Parse(error) => write!(f, "failed to parse config: {error}"),
-            Self::Invalid(errors) => write!(f, "invalid config: {}", errors.join("; ")),
-        }
-    }
-}
-
-impl std::error::Error for ConfigError {}
-
-impl From<serde_yaml::Error> for ConfigError {
-    fn from(error: serde_yaml::Error) -> Self {
-        Self::Parse(error)
-    }
 }
 
 pub fn parse_config_str(input: &str) -> Result<Config, ConfigError> {

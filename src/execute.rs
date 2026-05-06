@@ -1,5 +1,4 @@
 use std::env;
-use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
@@ -7,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::config::ConflictPolicy;
 use crate::facts::file::{FileFactError, FileFacts};
@@ -243,7 +243,7 @@ fn dedupe_if_same_hash(
     let destination_hash = destination_facts.sha256()?.to_string();
     if source_facts.size() != destination_facts.size() || source_hash != destination_hash {
         return Err(ExecuteError::HashMismatch {
-            source,
+            source_path: source,
             destination: destination.to_path_buf(),
             source_hash,
             destination_hash,
@@ -678,37 +678,54 @@ fn new_action_id(run_id: &str, from: &Path, to: &Path) -> String {
     format!("{run_id}:{ts}:{}:{}", from.display(), to.display())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ExecuteError {
+    #[error("execution requires at least one destination root")]
     NoDestinationRoots,
+    #[error("destination {} is relative; execution requires absolute or ~/ destinations", .0.display())]
     RelativeDestination(PathBuf),
+    #[error("destination {} uses unsupported ~user syntax", .0.display())]
     UnsupportedTilde(PathBuf),
+    #[error("HOME is not available for ~/ destination expansion")]
     HomeUnavailable,
+    #[error("unsafe source {}; expected a regular non-symlink file", .0.display())]
     UnsafeSource(PathBuf),
+    #[error("unsafe destination {}", .0.display())]
     UnsafeDestination(PathBuf),
+    #[error("destination {} is outside configured roots {roots:?}", destination.display())]
     DestinationOutsideRoots {
         destination: PathBuf,
         roots: Vec<PathBuf>,
     },
+    #[error("destination {} already exists", .0.display())]
     DestinationExists(PathBuf),
+    #[error("could not find append-counter destination for {}", .0.display())]
     ConflictExhausted(PathBuf),
+    #[error("replace_if_same_hash refused: {} ({source_hash}) differs from {} ({destination_hash})", source_path.display(), destination.display())]
     HashMismatch {
-        source: PathBuf,
+        source_path: PathBuf,
         destination: PathBuf,
         source_hash: String,
         destination_hash: String,
     },
+    #[error("source and destination are the same path: {}", .0.display())]
     SameSourceDestination(PathBuf),
+    #[error("conflict policy {0:?} is not supported by execution yet")]
     UnsupportedConflict(ConflictPolicy),
+    #[error("nothing to undo")]
     NothingToUndo,
+    #[error("undo refused: {0}")]
     UndoRefused(String),
-    FileFact(FileFactError),
+    #[error(transparent)]
+    FileFact(#[from] FileFactError),
+    #[error("failed to {op} for {}: {source}", path.display())]
     Io {
         op: &'static str,
         path: PathBuf,
         source: io::Error,
     },
-    SerializeLog(serde_json::Error),
+    #[error("failed to serialize action log record: {0}")]
+    SerializeLog(#[source] serde_json::Error),
 }
 
 impl ExecuteError {
@@ -720,88 +737,6 @@ impl ExecuteError {
         }
     }
 }
-
-impl From<FileFactError> for ExecuteError {
-    fn from(error: FileFactError) -> Self {
-        Self::FileFact(error)
-    }
-}
-
-impl fmt::Display for ExecuteError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoDestinationRoots => {
-                write!(f, "execution requires at least one destination root")
-            }
-            Self::RelativeDestination(path) => write!(
-                f,
-                "destination {} is relative; execution requires absolute or ~/ destinations",
-                path.display()
-            ),
-            Self::UnsupportedTilde(path) => write!(
-                f,
-                "destination {} uses unsupported ~user syntax",
-                path.display()
-            ),
-            Self::HomeUnavailable => {
-                write!(f, "HOME is not available for ~/ destination expansion")
-            }
-            Self::UnsafeSource(path) => write!(
-                f,
-                "unsafe source {}; expected a regular non-symlink file",
-                path.display()
-            ),
-            Self::UnsafeDestination(path) => write!(f, "unsafe destination {}", path.display()),
-            Self::DestinationOutsideRoots { destination, roots } => write!(
-                f,
-                "destination {} is outside configured roots {:?}",
-                destination.display(),
-                roots
-            ),
-            Self::DestinationExists(path) => {
-                write!(f, "destination {} already exists", path.display())
-            }
-            Self::ConflictExhausted(path) => write!(
-                f,
-                "could not find append-counter destination for {}",
-                path.display()
-            ),
-            Self::HashMismatch {
-                source,
-                destination,
-                source_hash,
-                destination_hash,
-            } => write!(
-                f,
-                "replace_if_same_hash refused: {} ({}) differs from {} ({})",
-                source.display(),
-                source_hash,
-                destination.display(),
-                destination_hash
-            ),
-            Self::SameSourceDestination(path) => write!(
-                f,
-                "source and destination are the same path: {}",
-                path.display()
-            ),
-            Self::UnsupportedConflict(policy) => write!(
-                f,
-                "conflict policy {policy:?} is not supported by execution yet"
-            ),
-            Self::NothingToUndo => write!(f, "nothing to undo"),
-            Self::UndoRefused(message) => write!(f, "undo refused: {message}"),
-            Self::FileFact(error) => write!(f, "{error}"),
-            Self::Io { op, path, source } => {
-                write!(f, "failed to {op} for {}: {source}", path.display())
-            }
-            Self::SerializeLog(error) => {
-                write!(f, "failed to serialize action log record: {error}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ExecuteError {}
 
 #[cfg(test)]
 mod tests {

@@ -1,8 +1,8 @@
-use std::fmt;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use serde::Serialize;
+use thiserror::Error;
 
 use crate::config::{Action, Config, ConflictPolicy, Rule};
 use crate::expr::{self, Value};
@@ -172,30 +172,13 @@ fn template_values(
     values
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum PlanError {
-    Render(render::RenderError),
+    #[error(transparent)]
+    Render(#[from] render::RenderError),
+    #[error("action {0:?} is not supported by planning yet")]
     UnsupportedAction(&'static str),
 }
-
-impl From<render::RenderError> for PlanError {
-    fn from(error: render::RenderError) -> Self {
-        Self::Render(error)
-    }
-}
-
-impl fmt::Display for PlanError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Render(error) => write!(f, "{error}"),
-            Self::UnsupportedAction(action) => {
-                write!(f, "action {action:?} is not supported by planning yet")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PlanError {}
 
 #[cfg(test)]
 mod tests {

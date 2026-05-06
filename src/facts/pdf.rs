@@ -1,5 +1,4 @@
 use std::ffi::OsString;
-use std::fmt;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -8,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tempfile::{NamedTempFile, TempPath};
+use thiserror::Error;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -66,29 +66,30 @@ impl Default for PdfTextProvider {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum PdfTextError {
+    #[error("failed to {op} for {}: {source}", path.display())]
     Io {
         op: &'static str,
         path: PathBuf,
         source: io::Error,
     },
+    #[error("failed to create {purpose} tempfile: {source}")]
     TempFile {
         purpose: &'static str,
         source: io::Error,
     },
+    #[error("failed to spawn {command:?}: {source}")]
     Spawn {
         command: OsString,
         source: io::Error,
     },
-    Timeout {
-        timeout: Duration,
-    },
-    Exit {
-        status: ExitStatus,
-        stderr: String,
-    },
-    InvalidUtf8(std::string::FromUtf8Error),
+    #[error("pdftotext timed out after {timeout:?}")]
+    Timeout { timeout: Duration },
+    #[error("pdftotext exited with {status}: {}", stderr.trim())]
+    Exit { status: ExitStatus, stderr: String },
+    #[error("pdftotext output was not valid UTF-8: {0}")]
+    InvalidUtf8(#[source] std::string::FromUtf8Error),
 }
 
 impl PdfTextError {
@@ -108,29 +109,6 @@ impl PdfTextError {
         Self::Spawn { command, source }
     }
 }
-
-impl fmt::Display for PdfTextError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io { op, path, source } => {
-                write!(f, "failed to {op} for {}: {source}", path.display())
-            }
-            Self::TempFile { purpose, source } => {
-                write!(f, "failed to create {purpose} tempfile: {source}")
-            }
-            Self::Spawn { command, source } => {
-                write!(f, "failed to spawn {:?}: {source}", command)
-            }
-            Self::Timeout { timeout } => write!(f, "pdftotext timed out after {timeout:?}"),
-            Self::Exit { status, stderr } => {
-                write!(f, "pdftotext exited with {status}: {}", stderr.trim())
-            }
-            Self::InvalidUtf8(error) => write!(f, "pdftotext output was not valid UTF-8: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for PdfTextError {}
 
 fn wait_with_timeout(
     child: &mut std::process::Child,

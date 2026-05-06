@@ -1,8 +1,7 @@
-use std::fmt;
-
 use indexmap::IndexMap;
 use regex::Regex;
 use serde::Serialize;
+use thiserror::Error;
 
 /// Provisional CEL-like evaluator for the MVP.
 ///
@@ -211,46 +210,25 @@ impl Value {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ExprError {
+    #[error("parse error: {0}")]
     Parse(String),
+    #[error("unknown identifier {0:?}")]
     UnknownIdentifier(String),
+    #[error("unknown function {0:?}")]
     UnknownFunction(String),
+    #[error("function {function:?} expected {expected} argument(s), got {actual}")]
     ArityMismatch {
         function: String,
         expected: usize,
         actual: usize,
     },
+    #[error("type error: {0}")]
     TypeError(String),
-    BadRegex {
-        pattern: String,
-        message: String,
-    },
+    #[error("bad regex {pattern:?}: {message}")]
+    BadRegex { pattern: String, message: String },
 }
-
-impl fmt::Display for ExprError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Parse(message) => write!(f, "parse error: {message}"),
-            Self::UnknownIdentifier(name) => write!(f, "unknown identifier {name:?}"),
-            Self::UnknownFunction(name) => write!(f, "unknown function {name:?}"),
-            Self::ArityMismatch {
-                function,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "function {function:?} expected {expected} argument(s), got {actual}"
-            ),
-            Self::TypeError(message) => write!(f, "type error: {message}"),
-            Self::BadRegex { pattern, message } => {
-                write!(f, "bad regex {pattern:?}: {message}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ExprError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TokenKind {

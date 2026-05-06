@@ -1,6 +1,5 @@
 use std::env;
 use std::ffi::OsStr;
-use std::fmt;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -8,6 +7,7 @@ use std::process::{Command, Stdio};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
+use thiserror::Error;
 
 use crate::config::{Config, WatchConfig};
 
@@ -470,35 +470,40 @@ fn path_value(path: &Path) -> Value {
     Value::String(path.display().to_string())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum WatchmanError {
+    #[error("config does not define watch settings")]
     MissingWatchConfig,
+    #[error("config watch.paths must not be empty")]
     MissingWatchPaths,
+    #[error("HOME is not available for ~/ expansion")]
     HomeUnavailable,
+    #[error("unsupported ~user path {0:?}")]
     UnsupportedTilde(String),
-    Pattern {
-        pattern: String,
-        message: String,
-    },
+    #[error("invalid watch pattern {pattern:?}: {message}")]
+    Pattern { pattern: String, message: String },
+    #[error("unsafe Watchman path name {0:?}")]
     UnsafeWatchmanName(String),
+    #[error("watchman error: {0}")]
     Watchman(String),
-    TriggerDrift {
-        root: PathBuf,
-        message: String,
-    },
+    #[error("Watchman trigger drift for {}: {message}", root.display())]
+    TriggerDrift { root: PathBuf, message: String },
+    #[error("unexpected Watchman response: {0}")]
     UnexpectedResponse(Value),
+    #[error("unexpected IO state: {0}")]
     UnexpectedIo(String),
-    CommandFailed {
-        status: Option<i32>,
-        stderr: String,
-    },
+    #[error("watchman exited with {status:?}: {}", stderr.trim())]
+    CommandFailed { status: Option<i32>, stderr: String },
+    #[error("failed to {op} for {}: {source}", path.display())]
     Io {
         op: &'static str,
         path: PathBuf,
         source: io::Error,
     },
-    Json(serde_json::Error),
-    JsonShape(serde_json::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("JSON error: {0}")]
+    JsonShape(#[source] serde_json::Error),
 }
 
 impl WatchmanError {
@@ -510,46 +515,6 @@ impl WatchmanError {
         }
     }
 }
-
-impl From<serde_json::Error> for WatchmanError {
-    fn from(error: serde_json::Error) -> Self {
-        Self::Json(error)
-    }
-}
-
-impl fmt::Display for WatchmanError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingWatchConfig => write!(f, "config does not define watch settings"),
-            Self::MissingWatchPaths => write!(f, "config watch.paths must not be empty"),
-            Self::HomeUnavailable => write!(f, "HOME is not available for ~/ expansion"),
-            Self::UnsupportedTilde(path) => write!(f, "unsupported ~user path {path:?}"),
-            Self::Pattern { pattern, message } => {
-                write!(f, "invalid watch pattern {pattern:?}: {message}")
-            }
-            Self::UnsafeWatchmanName(name) => write!(f, "unsafe Watchman path name {name:?}"),
-            Self::Watchman(message) => write!(f, "watchman error: {message}"),
-            Self::TriggerDrift { root, message } => {
-                write!(
-                    f,
-                    "Watchman trigger drift for {}: {message}",
-                    root.display()
-                )
-            }
-            Self::UnexpectedResponse(value) => write!(f, "unexpected Watchman response: {value}"),
-            Self::UnexpectedIo(message) => write!(f, "unexpected IO state: {message}"),
-            Self::CommandFailed { status, stderr } => {
-                write!(f, "watchman exited with {status:?}: {}", stderr.trim())
-            }
-            Self::Io { op, path, source } => {
-                write!(f, "failed to {op} for {}: {source}", path.display())
-            }
-            Self::Json(error) | Self::JsonShape(error) => write!(f, "JSON error: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for WatchmanError {}
 
 #[cfg(test)]
 mod tests {

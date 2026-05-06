@@ -1,4 +1,3 @@
-use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 use chrono::NaiveDate;
@@ -6,6 +5,7 @@ use indexmap::IndexMap;
 use minijinja::{Environment, Error as MiniJinjaError, ErrorKind, UndefinedBehavior};
 use regex::Regex;
 use serde_json::{Map as JsonMap, Value as JsonValue};
+use thiserror::Error;
 
 use crate::config::Extractor;
 
@@ -262,78 +262,36 @@ fn validate_rendered_path(rendered: &str, mode: PathMode) -> Result<(), RenderEr
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RenderError {
-    MissingFact {
-        variable: String,
-        fact: String,
-    },
+    #[error("extractor {variable:?} requires missing fact {fact:?}")]
+    MissingFact { variable: String, fact: String },
+    #[error("extractor {variable:?} has bad regex {regex:?}: {message}")]
     BadRegex {
         variable: String,
         regex: String,
         message: String,
     },
-    NoMatch {
-        variable: String,
-        fact: String,
-    },
+    #[error("extractor {variable:?} did not match fact {fact:?}")]
+    NoMatch { variable: String, fact: String },
+    #[error(
+        "extractor {variable:?} could not parse date {value:?} with format {format:?}: {message}"
+    )]
     DateParse {
         variable: String,
         value: String,
         format: String,
         message: String,
     },
+    #[error("template error: {0}")]
     Template(String),
+    #[error("template context error: {0}")]
     TemplateContext(String),
-    UnsafeVariable {
-        variable: String,
-        reason: String,
-    },
-    UnsafePath {
-        path: String,
-        reason: String,
-    },
+    #[error("unsafe template variable {variable:?}: {reason}")]
+    UnsafeVariable { variable: String, reason: String },
+    #[error("unsafe rendered path {path:?}: {reason}")]
+    UnsafePath { path: String, reason: String },
 }
-
-impl fmt::Display for RenderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingFact { variable, fact } => {
-                write!(f, "extractor {variable:?} requires missing fact {fact:?}")
-            }
-            Self::BadRegex {
-                variable,
-                regex,
-                message,
-            } => write!(
-                f,
-                "extractor {variable:?} has bad regex {regex:?}: {message}"
-            ),
-            Self::NoMatch { variable, fact } => {
-                write!(f, "extractor {variable:?} did not match fact {fact:?}")
-            }
-            Self::DateParse {
-                variable,
-                value,
-                format,
-                message,
-            } => write!(
-                f,
-                "extractor {variable:?} could not parse date {value:?} with format {format:?}: {message}"
-            ),
-            Self::Template(message) => write!(f, "template error: {message}"),
-            Self::TemplateContext(message) => write!(f, "template context error: {message}"),
-            Self::UnsafeVariable { variable, reason } => {
-                write!(f, "unsafe template variable {variable:?}: {reason}")
-            }
-            Self::UnsafePath { path, reason } => {
-                write!(f, "unsafe rendered path {path:?}: {reason}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for RenderError {}
 
 #[cfg(test)]
 mod tests {

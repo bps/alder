@@ -1,4 +1,3 @@
-use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -6,6 +5,7 @@ use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 #[derive(Debug)]
 pub struct FileFacts {
@@ -125,17 +125,17 @@ pub enum FileFactValue {
     Time(SystemTime),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum FileFactError {
+    #[error("failed to {op} for {} ({kind:?}): {message}", path.display())]
     Io {
         op: &'static str,
         path: PathBuf,
         kind: io::ErrorKind,
         message: String,
     },
-    NotRegularFile {
-        path: PathBuf,
-    },
+    #[error("{} is not a regular file", path.display())]
+    NotRegularFile { path: PathBuf },
 }
 
 impl FileFactError {
@@ -154,28 +154,6 @@ impl FileFactError {
         }
     }
 }
-
-impl fmt::Display for FileFactError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io {
-                op,
-                path,
-                kind,
-                message,
-            } => write!(
-                f,
-                "failed to {op} for {} ({kind:?}): {message}",
-                path.display()
-            ),
-            Self::NotRegularFile { path } => {
-                write!(f, "{} is not a regular file", path.display())
-            }
-        }
-    }
-}
-
-impl std::error::Error for FileFactError {}
 
 fn sha256_file(path: &Path) -> Result<String, FileFactError> {
     let mut file = File::open(path).map_err(|error| FileFactError::io("open file", path, error))?;

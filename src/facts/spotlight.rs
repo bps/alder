@@ -1,5 +1,4 @@
 use std::ffi::OsString;
-use std::fmt;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -10,6 +9,7 @@ use std::time::{Duration, Instant};
 use indexmap::IndexMap;
 use plist::Value;
 use tempfile::{NamedTempFile, TempPath};
+use thiserror::Error;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -105,30 +105,33 @@ impl Default for SpotlightProvider {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum SpotlightError {
+    #[error("Spotlight mdls provider is only available on macOS")]
     Unavailable,
+    #[error("failed to {op} for {}: {source}", path.display())]
     Io {
         op: &'static str,
         path: PathBuf,
         source: io::Error,
     },
+    #[error("failed to create {purpose} tempfile: {source}")]
     TempFile {
         purpose: &'static str,
         source: io::Error,
     },
+    #[error("failed to spawn {command:?}: {source}")]
     Spawn {
         command: OsString,
         source: io::Error,
     },
-    Timeout {
-        timeout: Duration,
-    },
-    Exit {
-        status: ExitStatus,
-        stderr: String,
-    },
-    ParsePlist(plist::Error),
+    #[error("mdls timed out after {timeout:?}")]
+    Timeout { timeout: Duration },
+    #[error("mdls exited with {status}: {}", stderr.trim())]
+    Exit { status: ExitStatus, stderr: String },
+    #[error("failed to parse mdls plist output: {0}")]
+    ParsePlist(#[source] plist::Error),
+    #[error("mdls plist output was not a dictionary")]
     UnexpectedPlistRoot,
 }
 
@@ -149,29 +152,6 @@ impl SpotlightError {
         Self::Spawn { command, source }
     }
 }
-
-impl fmt::Display for SpotlightError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unavailable => write!(f, "Spotlight mdls provider is only available on macOS"),
-            Self::Io { op, path, source } => {
-                write!(f, "failed to {op} for {}: {source}", path.display())
-            }
-            Self::TempFile { purpose, source } => {
-                write!(f, "failed to create {purpose} tempfile: {source}")
-            }
-            Self::Spawn { command, source } => write!(f, "failed to spawn {:?}: {source}", command),
-            Self::Timeout { timeout } => write!(f, "mdls timed out after {timeout:?}"),
-            Self::Exit { status, stderr } => {
-                write!(f, "mdls exited with {status}: {}", stderr.trim())
-            }
-            Self::ParsePlist(error) => write!(f, "failed to parse mdls plist output: {error}"),
-            Self::UnexpectedPlistRoot => write!(f, "mdls plist output was not a dictionary"),
-        }
-    }
-}
-
-impl std::error::Error for SpotlightError {}
 
 fn wait_with_timeout(
     child: &mut std::process::Child,
