@@ -4,3 +4,4 @@ pub mod expr;
 pub mod facts;
 pub mod planning;
 pub mod render;
+pub mod watchman;

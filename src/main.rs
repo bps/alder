@@ -1,8 +1,18 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::{env, fs, io};
 
-use clap::{Args, CommandFactory, Parser, Subcommand};
+#[cfg(test)]
+use clap::CommandFactory;
+use clap::{Args, Parser, Subcommand};
 
+use alder::config::parse_config_str;
+use alder::watchman::{
+    WatchmanGenerateOptions, generate_trigger_commands, parse_watchman_stdin, watchman_check,
+    watchman_sync, watchman_unsync,
+};
+
+const EXIT_ERROR: u8 = 1;
 const EXIT_NOT_IMPLEMENTED: u8 = 2;
 
 /// Default config discovery order used by future config loading:
@@ -52,6 +62,9 @@ enum Command {
 
     /// Print Watchman integration guidance or run a future watcher helper.
     Watch,
+
+    /// Manage Alder-owned Watchman triggers.
+    Watchman(WatchmanArgs),
 }
 
 #[derive(Debug, Args)]
@@ -68,12 +81,16 @@ struct RunArgs {
 #[derive(Debug, Args)]
 struct IngestArgs {
     /// Candidate files to process.
-    #[arg(required = true, value_name = "PATH")]
+    #[arg(value_name = "PATH")]
     paths: Vec<PathBuf>,
 
     /// Produce an action plan without changing the filesystem.
     #[arg(long)]
     dry_run: bool,
+
+    /// Read Watchman trigger JSON from stdin instead of path arguments.
+    #[arg(long)]
+    from_watchman: bool,
 }
 
 #[derive(Debug, Args)]
@@ -88,6 +105,27 @@ struct UndoArgs {
     /// Action log entry or selector to undo. Defaults to the most recent action.
     #[arg(value_name = "TARGET")]
     target: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct WatchmanArgs {
+    #[command(subcommand)]
+    command: WatchmanCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum WatchmanCommand {
+    /// Print generated Watchman trigger commands as JSON.
+    Print,
+
+    /// Register or update Alder-owned Watchman triggers.
+    Sync,
+
+    /// Verify Watchman triggers match the current config.
+    Check,
+
+    /// Remove Alder-owned Watchman triggers.
+    Unsync,
 }
 
 fn main() -> ExitCode {
@@ -113,16 +151,7 @@ fn run(cli: Cli) -> ExitCode {
                 config_hint
             ),
         ),
-        Command::Ingest(args) => stub(
-            cli.json,
-            "ingest",
-            format!(
-                "would process {} candidate file(s), dry_run={}, config={}",
-                args.paths.len(),
-                args.dry_run,
-                config_hint
-            ),
-        ),
+        Command::Ingest(args) => run_ingest(cli.config.as_ref(), cli.json, args),
         Command::Facts(args) => stub(
             cli.json,
             "facts",
@@ -155,7 +184,150 @@ fn run(cli: Cli) -> ExitCode {
             "watch",
             format!("would use Watchman with config={config_hint}"),
         ),
+        Command::Watchman(args) => run_watchman(cli.config.as_ref(), args),
     }
+}
+
+fn run_ingest(config_path: Option<&PathBuf>, json: bool, args: IngestArgs) -> ExitCode {
+    if args.from_watchman {
+        return parse_watchman_ingest(config_path, json);
+    }
+
+    if args.paths.is_empty() {
+        eprintln!("alder ingest: expected PATH... or --from-watchman");
+        return ExitCode::from(EXIT_ERROR);
+    }
+
+    let config_hint = config_path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| DEFAULT_CONFIG_CANDIDATES.join(" then "));
+    stub(
+        json,
+        "ingest",
+        format!(
+            "would process {} candidate file(s), dry_run={}, config={}",
+            args.paths.len(),
+            args.dry_run,
+            config_hint
+        ),
+    )
+}
+
+fn parse_watchman_ingest(config_path: Option<&PathBuf>, json: bool) -> ExitCode {
+    let config_path = match resolve_config_path(config_path) {
+        Ok(path) => path,
+        Err(error) => return error_exit(error),
+    };
+    let config = match load_config(&config_path) {
+        Ok(config) => config,
+        Err(error) => return error_exit(error),
+    };
+    let Some(watch) = config.watch.as_ref() else {
+        return error_exit("config does not define watch settings".to_string());
+    };
+    let root = match env::var_os("WATCHMAN_ROOT") {
+        Some(root) => PathBuf::from(root),
+        None => return error_exit("WATCHMAN_ROOT is required with --from-watchman".to_string()),
+    };
+
+    let mut input = String::new();
+    if let Err(error) = io::Read::read_to_string(&mut io::stdin(), &mut input) {
+        return error_exit(format!("failed to read Watchman stdin: {error}"));
+    }
+    let candidates = match parse_watchman_stdin(&input, root, watch) {
+        Ok(candidates) => candidates,
+        Err(error) => return error_exit(error.to_string()),
+    };
+
+    if json {
+        match serde_json::to_string_pretty(&candidates) {
+            Ok(output) => println!("{output}"),
+            Err(error) => return error_exit(format!("failed to encode candidates: {error}")),
+        }
+    } else {
+        for candidate in &candidates {
+            println!("{}", candidate.display());
+        }
+    }
+
+    eprintln!("alder ingest --from-watchman: parsed candidates; ingest pipeline is not wired yet");
+    ExitCode::from(EXIT_NOT_IMPLEMENTED)
+}
+
+fn run_watchman(config_path: Option<&PathBuf>, args: WatchmanArgs) -> ExitCode {
+    let config_path = match resolve_config_path(config_path) {
+        Ok(path) => path,
+        Err(error) => return error_exit(error),
+    };
+    let config = match load_config(&config_path) {
+        Ok(config) => config,
+        Err(error) => return error_exit(error),
+    };
+    let alder_exe = match env::current_exe() {
+        Ok(path) => path,
+        Err(error) => return error_exit(format!("failed to locate current executable: {error}")),
+    };
+    let options = WatchmanGenerateOptions::new(config_path, alder_exe);
+
+    match args.command {
+        WatchmanCommand::Print => {
+            let commands = match generate_trigger_commands(&config, &options) {
+                Ok(commands) => commands,
+                Err(error) => return error_exit(error.to_string()),
+            };
+            match serde_json::to_string_pretty(&commands) {
+                Ok(output) => {
+                    println!("{output}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => error_exit(format!("failed to encode Watchman commands: {error}")),
+            }
+        }
+        WatchmanCommand::Sync => match watchman_sync(&config, &options) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => error_exit(error.to_string()),
+        },
+        WatchmanCommand::Check => match watchman_check(&config, &options) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => error_exit(error.to_string()),
+        },
+        WatchmanCommand::Unsync => match watchman_unsync(&config, &options) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => error_exit(error.to_string()),
+        },
+    }
+}
+
+fn resolve_config_path(config_path: Option<&PathBuf>) -> Result<PathBuf, String> {
+    if let Some(path) = config_path {
+        return std::path::absolute(path)
+            .map_err(|error| format!("failed to resolve config path {}: {error}", path.display()));
+    }
+
+    for candidate in DEFAULT_CONFIG_CANDIDATES {
+        let path = PathBuf::from(candidate);
+        if path.exists() {
+            return std::path::absolute(&path).map_err(|error| {
+                format!("failed to resolve config path {}: {error}", path.display())
+            });
+        }
+    }
+
+    Err(format!(
+        "no config path provided and none found: {}",
+        DEFAULT_CONFIG_CANDIDATES.join(", ")
+    ))
+}
+
+fn load_config(path: &PathBuf) -> Result<alder::config::Config, String> {
+    let input = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read config {}: {error}", path.display()))?;
+    parse_config_str(&input).map_err(|error| error.to_string())
+}
+
+fn error_exit(error: String) -> ExitCode {
+    eprintln!("alder: {error}");
+    ExitCode::from(EXIT_ERROR)
 }
 
 fn stub(json: bool, command: &str, detail: String) -> ExitCode {
@@ -220,6 +392,30 @@ mod tests {
         match cli.command {
             Command::Undo(args) => assert_eq!(args.target, None),
             other => panic!("expected undo command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_watchman_print() {
+        let cli =
+            Cli::try_parse_from(["alder", "--config", "alder.yaml", "watchman", "print"]).unwrap();
+
+        match cli.command {
+            Command::Watchman(args) => assert!(matches!(args.command, WatchmanCommand::Print)),
+            other => panic!("expected watchman command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ingest_from_watchman_without_paths() {
+        let cli = Cli::try_parse_from(["alder", "ingest", "--from-watchman"]).unwrap();
+
+        match cli.command {
+            Command::Ingest(args) => {
+                assert!(args.from_watchman);
+                assert!(args.paths.is_empty());
+            }
+            other => panic!("expected ingest command, got {other:?}"),
         }
     }
 }
