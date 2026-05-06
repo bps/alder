@@ -7,6 +7,9 @@ use clap::CommandFactory;
 use clap::{Args, Parser, Subcommand};
 
 use alder::config::parse_config_str;
+use alder::pipeline::{
+    ProcessOptions, destination_roots, explain_file, facts_for_file, process_paths,
+};
 use alder::watchman::{
     WatchmanGenerateOptions, generate_trigger_commands, parse_watchman_stdin, watchman_check,
     watchman_sync, watchman_unsync,
@@ -141,31 +144,10 @@ fn run(cli: Cli) -> ExitCode {
         .unwrap_or_else(|| DEFAULT_CONFIG_CANDIDATES.join(" then "));
 
     match cli.command {
-        Command::Run(args) => stub(
-            cli.json,
-            "run",
-            format!(
-                "would scan {} path(s), dry_run={}, config={}",
-                args.paths.len(),
-                args.dry_run,
-                config_hint
-            ),
-        ),
+        Command::Run(args) => run_paths(cli.config.as_ref(), cli.json, args.paths, args.dry_run),
         Command::Ingest(args) => run_ingest(cli.config.as_ref(), cli.json, args),
-        Command::Facts(args) => stub(
-            cli.json,
-            "facts",
-            format!("would produce facts for {}", args.file.display()),
-        ),
-        Command::Explain(args) => stub(
-            cli.json,
-            "explain",
-            format!(
-                "would explain {} with config={}",
-                args.file.display(),
-                config_hint
-            ),
-        ),
+        Command::Facts(args) => run_facts(cli.config.as_ref(), cli.json, args),
+        Command::Explain(args) => run_explain(cli.config.as_ref(), cli.json, args),
         Command::Test => stub(
             cli.json,
             "test",
@@ -188,9 +170,43 @@ fn run(cli: Cli) -> ExitCode {
     }
 }
 
+fn run_paths(
+    config_path: Option<&PathBuf>,
+    json: bool,
+    paths: Vec<PathBuf>,
+    dry_run: bool,
+) -> ExitCode {
+    let config_path = match resolve_config_path(config_path) {
+        Ok(path) => path,
+        Err(error) => return error_exit(error),
+    };
+    let config = match load_config(&config_path) {
+        Ok(config) => config,
+        Err(error) => return error_exit(error),
+    };
+    let roots = match destination_roots(&config) {
+        Ok(roots) => roots,
+        Err(error) => return error_exit(error),
+    };
+    if !dry_run && roots.is_empty() {
+        return error_exit(
+            "non-dry-run execution requires defaults.destination_roots in config".to_string(),
+        );
+    }
+
+    let options = ProcessOptions {
+        dry_run,
+        destination_roots: roots,
+        action_log_path: default_action_log_path(),
+        run_id: default_run_id(),
+    };
+    let results = process_paths(&config, &paths, &options);
+    print_results(json, &results)
+}
+
 fn run_ingest(config_path: Option<&PathBuf>, json: bool, args: IngestArgs) -> ExitCode {
     if args.from_watchman {
-        return parse_watchman_ingest(config_path, json);
+        return parse_watchman_ingest(config_path, json, args.dry_run);
     }
 
     if args.paths.is_empty() {
@@ -198,22 +214,10 @@ fn run_ingest(config_path: Option<&PathBuf>, json: bool, args: IngestArgs) -> Ex
         return ExitCode::from(EXIT_ERROR);
     }
 
-    let config_hint = config_path
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| DEFAULT_CONFIG_CANDIDATES.join(" then "));
-    stub(
-        json,
-        "ingest",
-        format!(
-            "would process {} candidate file(s), dry_run={}, config={}",
-            args.paths.len(),
-            args.dry_run,
-            config_hint
-        ),
-    )
+    run_paths(config_path, json, args.paths, args.dry_run)
 }
 
-fn parse_watchman_ingest(config_path: Option<&PathBuf>, json: bool) -> ExitCode {
+fn parse_watchman_ingest(config_path: Option<&PathBuf>, json: bool, dry_run: bool) -> ExitCode {
     let config_path = match resolve_config_path(config_path) {
         Ok(path) => path,
         Err(error) => return error_exit(error),
@@ -238,20 +242,64 @@ fn parse_watchman_ingest(config_path: Option<&PathBuf>, json: bool) -> ExitCode 
         Ok(candidates) => candidates,
         Err(error) => return error_exit(error.to_string()),
     };
-
-    if json {
-        match serde_json::to_string_pretty(&candidates) {
-            Ok(output) => println!("{output}"),
-            Err(error) => return error_exit(format!("failed to encode candidates: {error}")),
-        }
-    } else {
-        for candidate in &candidates {
-            println!("{}", candidate.display());
-        }
+    let roots = match destination_roots(&config) {
+        Ok(roots) => roots,
+        Err(error) => return error_exit(error),
+    };
+    if !dry_run && roots.is_empty() {
+        return error_exit(
+            "non-dry-run execution requires defaults.destination_roots in config".to_string(),
+        );
     }
+    let options = ProcessOptions {
+        dry_run,
+        destination_roots: roots,
+        action_log_path: default_action_log_path(),
+        run_id: default_run_id(),
+    };
+    let results = process_paths(&config, &candidates, &options);
+    print_results(json, &results)
+}
 
-    eprintln!("alder ingest --from-watchman: parsed candidates; ingest pipeline is not wired yet");
-    ExitCode::from(EXIT_NOT_IMPLEMENTED)
+fn run_facts(config_path: Option<&PathBuf>, json: bool, args: FileOutputArgs) -> ExitCode {
+    let config_path = match resolve_config_path(config_path) {
+        Ok(path) => path,
+        Err(error) => return error_exit(error),
+    };
+    let config = match load_config(&config_path) {
+        Ok(config) => config,
+        Err(error) => return error_exit(error),
+    };
+    let output = facts_for_file(&config, args.file);
+    if json {
+        print_json(&output)
+    } else {
+        for (key, value) in output.facts {
+            println!("{key}: {value:?}");
+        }
+        for error in output.provider_errors {
+            eprintln!("provider error: {error}");
+        }
+        ExitCode::SUCCESS
+    }
+}
+
+fn run_explain(config_path: Option<&PathBuf>, json: bool, args: FileOutputArgs) -> ExitCode {
+    let config_path = match resolve_config_path(config_path) {
+        Ok(path) => path,
+        Err(error) => return error_exit(error),
+    };
+    let config = match load_config(&config_path) {
+        Ok(config) => config,
+        Err(error) => return error_exit(error),
+    };
+    let result = explain_file(&config, args.file);
+    if json {
+        print_json(&result)
+    } else {
+        print_human_result(&result);
+        exit_for_results(std::slice::from_ref(&result))
+    }
 }
 
 fn run_watchman(config_path: Option<&PathBuf>, args: WatchmanArgs) -> ExitCode {
@@ -323,6 +371,92 @@ fn load_config(path: &PathBuf) -> Result<alder::config::Config, String> {
     let input = fs::read_to_string(path)
         .map_err(|error| format!("failed to read config {}: {error}", path.display()))?;
     parse_config_str(&input).map_err(|error| error.to_string())
+}
+
+fn default_action_log_path() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local/state/alder/actions.jsonl")
+}
+
+fn default_run_id() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string()
+}
+
+fn print_results(json: bool, results: &[alder::pipeline::PipelineResult]) -> ExitCode {
+    if json {
+        print_json(results)
+    } else {
+        for result in results {
+            print_human_result(result);
+        }
+        exit_for_results(results)
+    }
+}
+
+fn print_json<T: serde::Serialize + ?Sized>(value: &T) -> ExitCode {
+    match serde_json::to_string_pretty(value) {
+        Ok(output) => {
+            println!("{output}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => error_exit(format!("failed to encode JSON: {error}")),
+    }
+}
+
+fn print_human_result(result: &alder::pipeline::PipelineResult) {
+    println!("File: {}", result.source.display());
+    for error in &result.provider_errors {
+        println!("  Provider error: {error}");
+    }
+    if let Some(explanation) = &result.explanation {
+        for eval in &explanation.rule_evaluations {
+            let status = if eval.matched {
+                "matched"
+            } else {
+                "not matched"
+            };
+            let shadowed = if eval.shadowed { ", shadowed" } else { "" };
+            println!("  Rule {}: {status}{shadowed}", eval.rule_id);
+            if let Some(error) = &eval.error {
+                println!("    Error: {error}");
+            }
+        }
+        if let Some(plan) = &explanation.plan {
+            println!("  Plan: {}", plan.rule_id);
+            for action in &plan.actions {
+                println!("    {action:?}");
+            }
+        } else {
+            println!("  Plan: none");
+        }
+    }
+    if let Some(execution) = &result.execution {
+        for record in &execution.records {
+            println!(
+                "  Executed {}: {:?} -> {}",
+                record.action,
+                record.status,
+                record.destination.display()
+            );
+        }
+    }
+    if let Some(error) = &result.error {
+        println!("  Error: {error}");
+    }
+}
+
+fn exit_for_results(results: &[alder::pipeline::PipelineResult]) -> ExitCode {
+    if results.iter().any(|result| result.error.is_some()) {
+        ExitCode::from(EXIT_ERROR)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 fn error_exit(error: String) -> ExitCode {

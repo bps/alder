@@ -56,6 +56,9 @@ pub struct DefaultsConfig {
     pub conflict: Option<ConflictPolicy>,
 
     #[serde(default)]
+    pub destination_roots: Vec<String>,
+
+    #[serde(default)]
     pub unmatched: Option<UnmatchedAction>,
 }
 

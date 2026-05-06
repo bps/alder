@@ -12,3 +12,6 @@
 
 # Alder local state/cache, if created during prototyping
 .alder/
+
+# Local sandbox used in development walkthroughs
+/tmp/

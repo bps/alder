@@ -2,12 +2,14 @@ use std::fmt;
 
 use indexmap::IndexMap;
 use regex::Regex;
+use serde::Serialize;
 
 /// Provisional CEL-like evaluator for the MVP.
 ///
 /// This is intentionally a tiny, swappable subset. Dotted identifiers such as
 /// `file.ext` are treated as single fact keys, not as general member access.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Value {
     Null,
     Bool(bool),
