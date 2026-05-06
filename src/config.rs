@@ -2,8 +2,7 @@ use std::collections::HashSet;
 use std::fmt;
 
 use indexmap::IndexMap;
-use serde::{Deserialize, Deserializer, Serialize, de};
-use serde_yaml::Value;
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,7 +91,7 @@ pub struct Rule {
     #[serde(default)]
     pub extract: IndexMap<String, Extractor>,
 
-    #[serde(default)]
+    #[serde(default, with = "serde_yaml::with::singleton_map_recursive")]
     pub actions: Vec<Action>,
 }
 
@@ -106,68 +105,23 @@ pub struct Extractor {
     pub format: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     Move(MoveAction),
     Copy(CopyAction),
     Rename(RenameAction),
     Tag(TagAction),
-    Review(ReviewAction),
-    MoveToReview(MoveToReviewAction),
+    Review(#[serde(deserialize_with = "deserialize_default_from_null")] ReviewAction),
+    MoveToReview(#[serde(deserialize_with = "deserialize_default_from_null")] MoveToReviewAction),
 }
 
-impl<'de> Deserialize<'de> for Action {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = Value::deserialize(deserializer)?;
-        let mapping = value
-            .as_mapping()
-            .ok_or_else(|| de::Error::custom("action must be a single-key map"))?;
-
-        if mapping.len() != 1 {
-            return Err(de::Error::custom(
-                "action must contain exactly one action key",
-            ));
-        }
-
-        let (key, body) = mapping.iter().next().expect("mapping has one entry");
-        let key = key
-            .as_str()
-            .ok_or_else(|| de::Error::custom("action key must be a string"))?;
-
-        match key {
-            "move" => deserialize_action_body(body, key).map(Self::Move),
-            "copy" => deserialize_action_body(body, key).map(Self::Copy),
-            "rename" => deserialize_action_body(body, key).map(Self::Rename),
-            "tag" => deserialize_action_body(body, key).map(Self::Tag),
-            "review" => deserialize_optional_action_body(body, key).map(Self::Review),
-            "move_to_review" => deserialize_optional_action_body(body, key).map(Self::MoveToReview),
-            other => Err(de::Error::custom(format!("unknown action {other:?}"))),
-        }
-    }
-}
-
-fn deserialize_action_body<T, E>(body: &Value, key: &str) -> Result<T, E>
+fn deserialize_default_from_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
-    T: for<'de> Deserialize<'de>,
-    E: de::Error,
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
 {
-    serde_yaml::from_value(body.clone())
-        .map_err(|error| E::custom(format!("invalid {key} action: {error}")))
-}
-
-fn deserialize_optional_action_body<T, E>(body: &Value, key: &str) -> Result<T, E>
-where
-    T: for<'de> Deserialize<'de> + Default,
-    E: de::Error,
-{
-    if matches!(body, Value::Null) {
-        Ok(T::default())
-    } else {
-        deserialize_action_body(body, key)
-    }
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
