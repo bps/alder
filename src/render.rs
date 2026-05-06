@@ -1,8 +1,9 @@
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
+use chrono::NaiveDate;
 use indexmap::IndexMap;
-use minijinja::{Environment, UndefinedBehavior};
+use minijinja::{Environment, Error as MiniJinjaError, ErrorKind, UndefinedBehavior};
 use regex::Regex;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -17,12 +18,6 @@ pub fn extract_variables(
     let mut variables = IndexMap::new();
 
     for (name, extractor) in extractors {
-        if extractor.format.is_some() {
-            return Err(RenderError::UnsupportedFormat {
-                variable: name.clone(),
-            });
-        }
-
         let source = facts
             .get(&extractor.from)
             .ok_or_else(|| RenderError::MissingFact {
@@ -39,18 +34,32 @@ pub fn extract_variables(
             fact: extractor.from.clone(),
         })?;
 
-        let value = captures
+        let captured = captures
             .name(name)
             .or_else(|| captures.get(1))
             .or_else(|| captures.get(0))
             .expect("captures always include full match")
-            .as_str()
-            .to_string();
+            .as_str();
+        let value = match &extractor.format {
+            Some(format) => parse_date_variable(name, captured, format)?,
+            None => captured.to_string(),
+        };
 
         variables.insert(name.clone(), value);
     }
 
     Ok(variables)
+}
+
+fn parse_date_variable(variable: &str, value: &str, format: &str) -> Result<String, RenderError> {
+    NaiveDate::parse_from_str(value, format)
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .map_err(|error| RenderError::DateParse {
+            variable: variable.to_string(),
+            value: value.to_string(),
+            format: format.to_string(),
+            message: error.to_string(),
+        })
 }
 
 pub fn render_template(
@@ -59,12 +68,23 @@ pub fn render_template(
 ) -> Result<String, RenderError> {
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Strict);
+    env.add_filter("date", date_filter);
     let context = build_template_context(variables)?;
     let tmpl = env
         .template_from_str(template)
         .map_err(|error| RenderError::Template(error.to_string()))?;
     tmpl.render(context)
         .map_err(|error| RenderError::Template(error.to_string()))
+}
+
+fn date_filter(value: &str, format: &str) -> Result<String, MiniJinjaError> {
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|error| {
+        MiniJinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("date filter expects YYYY-MM-DD input, got {value:?}: {error}"),
+        )
+    })?;
+    Ok(date.format(format).to_string())
 }
 
 fn build_template_context(variables: &IndexMap<String, String>) -> Result<JsonValue, RenderError> {
@@ -257,8 +277,11 @@ pub enum RenderError {
         variable: String,
         fact: String,
     },
-    UnsupportedFormat {
+    DateParse {
         variable: String,
+        value: String,
+        format: String,
+        message: String,
     },
     Template(String),
     TemplateContext(String),
@@ -289,9 +312,14 @@ impl fmt::Display for RenderError {
             Self::NoMatch { variable, fact } => {
                 write!(f, "extractor {variable:?} did not match fact {fact:?}")
             }
-            Self::UnsupportedFormat { variable } => write!(
+            Self::DateParse {
+                variable,
+                value,
+                format,
+                message,
+            } => write!(
                 f,
-                "extractor {variable:?} uses format, which is not implemented yet"
+                "extractor {variable:?} could not parse date {value:?} with format {format:?}: {message}"
             ),
             Self::Template(message) => write!(f, "template error: {message}"),
             Self::TemplateContext(message) => write!(f, "template context error: {message}"),
@@ -382,19 +410,37 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_format_errors() {
+    fn extractor_format_parses_date_to_iso() {
         let extractors = extractors([(
             "statement_date",
             Extractor {
                 from: "pdf.text".to_string(),
-                regex: "date".to_string(),
+                regex: r"Closing Date\s+(\d{2}/\d{2}/\d{4})".to_string(),
                 format: Some("%m/%d/%Y".to_string()),
             },
         )]);
+        let facts = facts([("pdf.text", "Closing Date 04/15/2026".to_string())]);
 
-        let error = extract_variables(&extractors, &FactStrings::new()).unwrap_err();
+        let variables = extract_variables(&extractors, &facts).unwrap();
 
-        assert!(matches!(error, RenderError::UnsupportedFormat { .. }));
+        assert_eq!(variables["statement_date"], "2026-04-15");
+    }
+
+    #[test]
+    fn invalid_extractor_date_errors() {
+        let extractors = extractors([(
+            "statement_date",
+            Extractor {
+                from: "pdf.text".to_string(),
+                regex: r"Closing Date\s+(\S+)".to_string(),
+                format: Some("%m/%d/%Y".to_string()),
+            },
+        )]);
+        let facts = facts([("pdf.text", "Closing Date nope".to_string())]);
+
+        let error = extract_variables(&extractors, &facts).unwrap_err();
+
+        assert!(matches!(error, RenderError::DateParse { .. }));
     }
 
     #[test]
@@ -404,6 +450,37 @@ mod tests {
         let rendered = render_template("{{ statement_date }} - Amex.pdf", &variables).unwrap();
 
         assert_eq!(rendered, "2026-04-15 - Amex.pdf");
+    }
+
+    #[test]
+    fn date_filter_formats_iso_date() {
+        let variables = vars([("statement_date", "2026-04-15")]);
+
+        let rendered = render_template("{{ statement_date | date('%Y') }}", &variables).unwrap();
+
+        assert_eq!(rendered, "2026");
+    }
+
+    #[test]
+    fn date_filter_rejects_non_iso_input() {
+        let variables = vars([("statement_date", "04/15/2026")]);
+
+        let error = render_template("{{ statement_date | date('%Y') }}", &variables).unwrap_err();
+
+        assert!(error.to_string().contains("YYYY-MM-DD"));
+    }
+
+    #[test]
+    fn renders_design_style_date_destination() {
+        let variables = vars([("statement_date", "2026-04-15")]);
+
+        let path = render_safe_relative_path(
+            "Amex/{{ statement_date | date('%Y') }}/{{ statement_date }} - Amex.pdf",
+            &variables,
+        )
+        .unwrap();
+
+        assert_eq!(path, PathBuf::from("Amex/2026/2026-04-15 - Amex.pdf"));
     }
 
     #[test]
