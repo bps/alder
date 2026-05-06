@@ -177,7 +177,9 @@ The parser should reject unknown keys by default. Silent config acceptance is da
 
 CEL is the leading candidate because it is designed for safe embedded policy evaluation.
 
-Alder should validate the Rust CEL implementation before making CEL a hard architectural dependency. Evaluation criteria:
+Alder should validate the Rust CEL implementation before making CEL a hard architectural dependency. The current recommendation is to keep Alder's provisional evaluator behind an adapter boundary while prototyping the `cel` crate as the preferred replacement candidate. See [CEL implementation evaluation](cel-evaluation.md).
+
+Evaluation criteria:
 
 - Can host values be injected as nested objects such as `file.ext` and `pdf.text`?
 - Can custom functions be added, e.g. `contains`, `matches`, `lower`, `date_parse`?
