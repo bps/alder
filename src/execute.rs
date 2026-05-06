@@ -47,6 +47,7 @@ pub enum ExecutionStatus {
     Moved,
     Skipped,
     Failed,
+    Deduped,
     Undone,
 }
 
@@ -135,6 +136,9 @@ fn execute_move(
     let source = source_facts.path().to_path_buf();
     let requested_destination = resolve_destination(to)?;
     ensure_destination_in_roots(&requested_destination, &options.destination_roots)?;
+    if conflict == ConflictPolicy::ReplaceIfSameHash && requested_destination.exists() {
+        return dedupe_if_same_hash(plan, &source_facts, &requested_destination, options, log);
+    }
 
     let destination = resolve_conflict(&requested_destination, conflict)?;
     if destination != requested_destination {
@@ -165,9 +169,6 @@ fn execute_move(
                 sha256: None,
                 size: Some(source_facts.size()),
             });
-        }
-        ConflictPolicy::ReplaceIfSameHash => {
-            return Err(ExecuteError::UnsupportedConflict(conflict));
         }
         _ => {}
     }
@@ -225,6 +226,68 @@ fn execute_move(
     })
 }
 
+fn dedupe_if_same_hash(
+    plan: &ActionPlan,
+    source_facts: &FileFacts,
+    destination: &Path,
+    options: &ExecuteOptions,
+    log: &mut ActionLog,
+) -> Result<ExecutionRecord, ExecuteError> {
+    let source = source_facts.path().to_path_buf();
+    if source == destination {
+        return Err(ExecuteError::SameSourceDestination(source));
+    }
+    reject_unsafe_source(destination)?;
+    let destination_facts = FileFacts::from_path(destination)?;
+    let source_hash = source_facts.sha256()?.to_string();
+    let destination_hash = destination_facts.sha256()?.to_string();
+    if source_facts.size() != destination_facts.size() || source_hash != destination_hash {
+        return Err(ExecuteError::HashMismatch {
+            source,
+            destination: destination.to_path_buf(),
+            source_hash,
+            destination_hash,
+        });
+    }
+
+    let fresh_source = FileFacts::from_path(&source)?;
+    if fresh_source.size() != source_facts.size() || fresh_source.sha256()? != source_hash {
+        return Err(ExecuteError::UndoRefused(
+            "source changed while verifying replace_if_same_hash".to_string(),
+        ));
+    }
+
+    fs::remove_file(&source)
+        .map_err(|error| ExecuteError::io("remove duplicate source", &source, error))?;
+
+    let action_id = new_action_id(&options.run_id, &source, destination);
+    let record = ActionLogRecord::new(
+        action_id,
+        None,
+        &options.run_id,
+        &plan.rule_id,
+        "move",
+        ExecutionStatus::Deduped,
+        &source,
+        destination,
+        Some(source_hash.clone()),
+        Some(source_facts.size()),
+        Some("destination already has same hash; removed source duplicate".to_string()),
+    );
+    log.append(&record)?;
+
+    Ok(ExecutionRecord {
+        action: "move".to_string(),
+        source,
+        destination: destination.to_path_buf(),
+        status: ExecutionStatus::Deduped,
+        reason: Some("destination already has same hash; removed source duplicate".to_string()),
+        rule_id: plan.rule_id.clone(),
+        sha256: Some(source_hash),
+        size: Some(source_facts.size()),
+    })
+}
+
 fn reject_unsafe_source(source: &Path) -> Result<(), ExecuteError> {
     let metadata = fs::symlink_metadata(source)
         .map_err(|error| ExecuteError::io("read source metadata", source, error))?;
@@ -248,7 +311,7 @@ fn resolve_conflict(
         )),
         ConflictPolicy::Skip | ConflictPolicy::Review => Ok(requested_destination.to_path_buf()),
         ConflictPolicy::AppendCounter => append_counter_destination(requested_destination),
-        ConflictPolicy::ReplaceIfSameHash => Err(ExecuteError::UnsupportedConflict(conflict)),
+        ConflictPolicy::ReplaceIfSameHash => Ok(requested_destination.to_path_buf()),
     }
 }
 
@@ -629,6 +692,13 @@ pub enum ExecuteError {
     },
     DestinationExists(PathBuf),
     ConflictExhausted(PathBuf),
+    HashMismatch {
+        source: PathBuf,
+        destination: PathBuf,
+        source_hash: String,
+        destination_hash: String,
+    },
+    SameSourceDestination(PathBuf),
     UnsupportedConflict(ConflictPolicy),
     NothingToUndo,
     UndoRefused(String),
@@ -694,6 +764,24 @@ impl fmt::Display for ExecuteError {
             Self::ConflictExhausted(path) => write!(
                 f,
                 "could not find append-counter destination for {}",
+                path.display()
+            ),
+            Self::HashMismatch {
+                source,
+                destination,
+                source_hash,
+                destination_hash,
+            } => write!(
+                f,
+                "replace_if_same_hash refused: {} ({}) differs from {} ({})",
+                source.display(),
+                source_hash,
+                destination.display(),
+                destination_hash
+            ),
+            Self::SameSourceDestination(path) => write!(
+                f,
+                "source and destination are the same path: {}",
                 path.display()
             ),
             Self::UnsupportedConflict(policy) => write!(
@@ -945,6 +1033,46 @@ mod tests {
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].action_id, "action-1");
+    }
+
+    #[test]
+    fn replace_if_same_hash_removes_duplicate_source_only() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.pdf");
+        let dest_root = temp_dir.path().join("dest");
+        fs::create_dir(&dest_root).unwrap();
+        let dest = dest_root.join("source.pdf");
+        fs::write(&source, b"abc").unwrap();
+        fs::write(&dest, b"abc").unwrap();
+        let log = temp_dir.path().join("actions.jsonl");
+        let plan = plan(&source, &dest, ConflictPolicy::ReplaceIfSameHash);
+
+        let report = execute_plan(&plan, &options(false, &dest_root, &log)).unwrap();
+
+        assert_eq!(report.records[0].status, ExecutionStatus::Deduped);
+        assert!(!source.exists());
+        assert_eq!(fs::read(&dest).unwrap(), b"abc");
+        let log_text = fs::read_to_string(log).unwrap();
+        assert!(log_text.contains(r#""status":"deduped""#));
+    }
+
+    #[test]
+    fn replace_if_same_hash_refuses_different_destination() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.pdf");
+        let dest_root = temp_dir.path().join("dest");
+        fs::create_dir(&dest_root).unwrap();
+        let dest = dest_root.join("source.pdf");
+        fs::write(&source, b"abc").unwrap();
+        fs::write(&dest, b"different").unwrap();
+        let log = temp_dir.path().join("actions.jsonl");
+        let plan = plan(&source, &dest, ConflictPolicy::ReplaceIfSameHash);
+
+        let error = execute_plan(&plan, &options(false, &dest_root, &log)).unwrap_err();
+
+        assert!(matches!(error, ExecuteError::HashMismatch { .. }));
+        assert_eq!(fs::read(&source).unwrap(), b"abc");
+        assert_eq!(fs::read(&dest).unwrap(), b"different");
     }
 
     fn plan(source: &Path, destination: &Path, conflict: ConflictPolicy) -> ActionPlan {
