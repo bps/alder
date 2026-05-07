@@ -420,6 +420,15 @@ fn print_human_result(result: &alder::pipeline::PipelineResult) {
         }
         if let Some(plan) = &explanation.plan {
             println!("  Plan: {}", plan.rule_id);
+            for diagnostic in &plan.extraction_diagnostics {
+                if let Some(selected) = &diagnostic.selected {
+                    let date = selected.date.as_deref().unwrap_or("unparsed");
+                    println!(
+                        "    Extracted {} from {}: {:?} -> {}",
+                        diagnostic.variable, diagnostic.fact, selected.text, date
+                    );
+                }
+            }
             for action in &plan.actions {
                 println!("    {action:?}");
             }

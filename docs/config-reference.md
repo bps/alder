@@ -139,7 +139,8 @@ when: |
 
 ## Extractors
 
-Extractors create variables for templates.
+Extractors create variables for templates. Existing extractors are regex
+extractors; `kind: regex` is optional for backward compatibility.
 
 ```yaml
 extract:
@@ -156,6 +157,37 @@ Fields:
 | `from` | fact key | Source fact, e.g. `pdf.text`. |
 | `regex` | regex string | First match wins. Named capture matching the variable name is preferred; otherwise capture group 1; otherwise the full match. |
 | `format` | date parse format | Optional chrono-style date parse format. If present, the extracted date is canonicalized to `YYYY-MM-DD`. |
+
+Date extractors scan for date candidates near normalized literal labels and
+return canonical `YYYY-MM-DD` strings:
+
+```yaml
+extract:
+  statement_date:
+    kind: date
+    from: pdf.text
+    after: "Statement Date:"
+    formats: ["%m/%d/%Y", "%Y-%m-%d", "%B %-d, %Y", "%b %-d, %Y"]
+```
+
+Fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `kind` | `date` | Required for date extractors. |
+| `from` | fact key | Source fact, e.g. `pdf.text`. |
+| `after` | string | Match a normalized literal label and choose the nearest valid date after it. Exactly one of `after`, `near`, or `scope: document` is required. |
+| `near` | string | Match a normalized literal label and require exactly one distinct valid date in the window. |
+| `scope` | `document` | Scan the whole fact and require exactly one distinct valid date. Conservative escape hatch for already-specific rules. |
+| `window` | `same_line`, `next_line`, `paragraph`, or `chars:N` | Defaults to `next_line` for `after` and `same_line` for `near`. |
+| `formats` | list of chrono date formats | Required and non-empty. Compact `%Y%m%d` candidates are scanned only when this format is listed. |
+| `min_year` / `max_year` | integer | Optional year bounds. Defaults are `1990` and current year + 1. |
+
+Label matching is case-insensitive, collapses whitespace, allows optional
+whitespace around label punctuation, and accepts optional trailing punctuation
+such as `:`, `.`, `-`, or `#`. Ambiguous windows fail instead of choosing a date
+silently. JSON explain output includes date extraction diagnostics for selected
+labels and candidates.
 
 ## Templates
 

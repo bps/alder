@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::config::{Action, Config, ConflictPolicy, Rule};
 use crate::expr::{self, Value};
-use crate::render::{self, FactStrings};
+use crate::render::{self, ExtractionDiagnostic, FactStrings};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Explanation {
@@ -31,6 +31,8 @@ pub struct ActionPlan {
     pub rule_id: String,
     pub rule_name: Option<String>,
     pub variables: IndexMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extraction_diagnostics: Vec<ExtractionDiagnostic>,
     pub actions: Vec<PlannedAction>,
 }
 
@@ -104,8 +106,8 @@ fn build_plan(
     source: &Path,
     string_facts: &FactStrings,
 ) -> Result<ActionPlan, PlanError> {
-    let extracted = render::extract_variables(&rule.extract, string_facts)?;
-    let template_values = template_values(string_facts, &extracted);
+    let extraction = render::extract_variables_with_diagnostics(&rule.extract, string_facts)?;
+    let template_values = template_values(string_facts, &extraction.variables);
     let mut planned_actions = Vec::new();
 
     if let Some(action) = rule.actions.first() {
@@ -135,7 +137,8 @@ fn build_plan(
         source: source.to_path_buf(),
         rule_id: rule.id.clone(),
         rule_name: rule.name.clone(),
-        variables: extracted,
+        variables: extraction.variables,
+        extraction_diagnostics: extraction.diagnostics,
         actions: planned_actions,
     })
 }
@@ -273,6 +276,49 @@ rules:
                 conflict: ConflictPolicy::AppendCounter,
                 terminal: true,
             }
+        );
+    }
+
+    #[test]
+    fn date_extraction_diagnostics_are_in_explain_plan() {
+        let config = parse_config_str(
+            r#"
+version: 1
+rules:
+  - id: statement
+    when: contains(pdf.text, "Columbia Gas")
+    extract:
+      statement_date:
+        kind: date
+        from: pdf.text
+        after: "Statement Date:"
+        formats: ["%m/%d/%Y"]
+    actions:
+      - move:
+          to: "Utilities/{{ statement_date | date('%Y%m%d') }} {{ file.name }}"
+"#,
+        )
+        .unwrap();
+        let facts = facts([
+            ("file.name", "bill.pdf"),
+            ("pdf.text", "Columbia Gas\nStatement Date: 04/15/2026"),
+        ]);
+
+        let explanation = plan_for_file(&config, "/tmp/bill.pdf", &facts).unwrap();
+        let plan = explanation.plan.unwrap();
+
+        assert_eq!(plan.variables["statement_date"], "2026-04-15");
+        assert_eq!(plan.extraction_diagnostics.len(), 1);
+        assert_eq!(
+            plan.extraction_diagnostics[0].matched_label.as_deref(),
+            Some("Statement Date:")
+        );
+        assert_eq!(
+            plan.extraction_diagnostics[0]
+                .selected
+                .as_ref()
+                .and_then(|candidate| candidate.date.as_deref()),
+            Some("2026-04-15")
         );
     }
 

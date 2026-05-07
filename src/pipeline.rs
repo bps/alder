@@ -425,7 +425,7 @@ pub fn required_facts(config: &Config) -> RequiredFacts {
             keys.extend(identifiers);
         }
         for extractor in rule.extract.values() {
-            keys.insert(extractor.from.clone());
+            keys.insert(extractor.from().to_string());
         }
     }
 

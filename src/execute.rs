@@ -1310,6 +1310,7 @@ mod tests {
             rule_id: "rule".to_string(),
             rule_name: None,
             variables: IndexMap::new(),
+            extraction_diagnostics: Vec::new(),
             actions: vec![PlannedAction::Move {
                 to: destination.to_path_buf(),
                 conflict,
@@ -1324,6 +1325,7 @@ mod tests {
             rule_id: "rule".to_string(),
             rule_name: None,
             variables: IndexMap::new(),
+            extraction_diagnostics: Vec::new(),
             actions: vec![PlannedAction::Trash { terminal: true }],
         }
     }
