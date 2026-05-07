@@ -4,6 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use serde::ser::SerializeTuple;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use thiserror::Error;
@@ -30,16 +31,33 @@ impl WatchmanGenerateOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct TriggerCommand(String, PathBuf, TriggerDefinition);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerCommand {
+    command: String,
+    root: PathBuf,
+    definition: TriggerDefinition,
+}
 
 impl TriggerCommand {
     pub fn root(&self) -> &Path {
-        &self.1
+        &self.root
     }
 
     pub fn definition(&self) -> &TriggerDefinition {
-        &self.2
+        &self.definition
+    }
+}
+
+impl Serialize for TriggerCommand {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut tuple = serializer.serialize_tuple(3)?;
+        tuple.serialize_element(&self.command)?;
+        tuple.serialize_element(&self.root)?;
+        tuple.serialize_element(&self.definition)?;
+        tuple.end()
     }
 }
 
@@ -133,10 +151,10 @@ pub fn generate_trigger_commands(
     let patterns = WatchPatterns::new(watch)?;
     let mut commands = Vec::new();
     for root in roots {
-        commands.push(TriggerCommand(
-            "trigger".to_string(),
+        commands.push(TriggerCommand {
+            command: "trigger".to_string(),
             root,
-            TriggerDefinition {
+            definition: TriggerDefinition {
                 name: options.trigger_name.clone(),
                 expression: patterns.expression(),
                 command: vec![
@@ -149,7 +167,7 @@ pub fn generate_trigger_commands(
                 append_files: false,
                 stdin: vec!["name".to_string(), "exists".to_string(), "type".to_string()],
             },
-        ));
+        });
     }
 
     Ok(commands)
