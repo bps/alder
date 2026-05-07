@@ -108,9 +108,9 @@ pub struct Extractor {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
-    Move(MoveAction),
-    Copy(CopyAction),
-    Rename(RenameAction),
+    Move(DestinationAction),
+    Copy(DestinationAction),
+    Rename(DestinationAction),
     Tag(TagAction),
     Review(#[serde(deserialize_with = "deserialize_default_from_null")] ReviewAction),
     MoveToReview(#[serde(deserialize_with = "deserialize_default_from_null")] MoveToReviewAction),
@@ -126,25 +126,7 @@ where
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct MoveAction {
-    pub to: String,
-
-    #[serde(default)]
-    pub conflict: Option<ConflictPolicy>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CopyAction {
-    pub to: String,
-
-    #[serde(default)]
-    pub conflict: Option<ConflictPolicy>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RenameAction {
+pub struct DestinationAction {
     pub to: String,
 
     #[serde(default)]
