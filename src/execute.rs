@@ -1,7 +1,6 @@
-use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
@@ -10,6 +9,7 @@ use thiserror::Error;
 
 use crate::config::ConflictPolicy;
 use crate::facts::file::{FileFactError, FileFacts};
+use crate::path_utils::{PathError, expand_user_path};
 use crate::planning::{ActionPlan, PlannedAction};
 
 const MAX_APPEND_COUNTER_ATTEMPTS: u32 = 1000;
@@ -356,38 +356,20 @@ fn move_without_overwrite(source: &Path, destination: &Path) -> Result<(), Execu
 
 fn resolve_destination(path: &Path) -> Result<PathBuf, ExecuteError> {
     let text = path.as_os_str().to_string_lossy();
-    let expanded = if text == "~" || text.starts_with("~/") {
-        let home = env::var_os("HOME").ok_or(ExecuteError::HomeUnavailable)?;
-        let home = PathBuf::from(home);
-        if text == "~" {
-            home
-        } else {
-            home.join(&text[2..])
-        }
-    } else if text.starts_with('~') {
-        return Err(ExecuteError::UnsupportedTilde(path.to_path_buf()));
-    } else if path.is_absolute() {
-        path.to_path_buf()
-    } else {
+    if !text.starts_with('~') && !path.is_absolute() {
         return Err(ExecuteError::RelativeDestination(path.to_path_buf()));
-    };
+    }
 
-    normalize_no_parent(&expanded)
+    expand_user_path(&text).map_err(|error| destination_path_error(error, path))
 }
 
-fn normalize_no_parent(path: &Path) -> Result<PathBuf, ExecuteError> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(part) => normalized.push(part),
-            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
-            Component::ParentDir => {
-                return Err(ExecuteError::UnsafeDestination(path.to_path_buf()));
-            }
-        }
+fn destination_path_error(error: PathError, original: &Path) -> ExecuteError {
+    match error {
+        PathError::HomeUnavailable => ExecuteError::HomeUnavailable,
+        PathError::UnsupportedTilde(_) => ExecuteError::UnsupportedTilde(original.to_path_buf()),
+        PathError::ParentDir(path) => ExecuteError::UnsafeDestination(path),
+        PathError::Io { path, source } => ExecuteError::io("resolve destination", path, source),
     }
-    Ok(normalized)
 }
 
 fn ensure_destination_in_roots(destination: &Path, roots: &[PathBuf]) -> Result<(), ExecuteError> {
@@ -872,6 +854,20 @@ mod tests {
             ExecuteError::DestinationOutsideRoots { .. }
         ));
         assert!(source.exists());
+    }
+
+    #[test]
+    fn relative_destination_errors_before_expansion() {
+        let error = resolve_destination(Path::new("relative.pdf")).unwrap_err();
+
+        assert!(matches!(error, ExecuteError::RelativeDestination(_)));
+    }
+
+    #[test]
+    fn destination_parent_components_are_unsafe() {
+        let error = resolve_destination(Path::new("~/../escape.pdf")).unwrap_err();
+
+        assert!(matches!(error, ExecuteError::UnsafeDestination(_)));
     }
 
     #[cfg(unix)]

@@ -1,4 +1,3 @@
-use std::env;
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
@@ -10,6 +9,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::config::{Config, WatchConfig};
+use crate::path_utils::{PathError, expand_user_path};
 
 const DEFAULT_TRIGGER_NAME: &str = "alder";
 
@@ -311,24 +311,17 @@ fn safe_relative_watchman_name(name: &str) -> Result<PathBuf, WatchmanError> {
 }
 
 fn expand_config_path(path: &str) -> Result<PathBuf, WatchmanError> {
-    let expanded = if path == "~" || path.starts_with("~/") {
-        let home = env::var_os("HOME").ok_or(WatchmanError::HomeUnavailable)?;
-        if path == "~" {
-            PathBuf::from(home)
-        } else {
-            PathBuf::from(home).join(&path[2..])
-        }
-    } else if path.starts_with('~') {
-        return Err(WatchmanError::UnsupportedTilde(path.to_string()));
-    } else {
-        PathBuf::from(path)
-    };
+    expand_user_path(path).map_err(watch_path_error)
+}
 
-    if expanded.is_absolute() {
-        Ok(expanded)
-    } else {
-        Ok(std::path::absolute(&expanded)
-            .map_err(|error| WatchmanError::io("make watch path absolute", &expanded, error))?)
+fn watch_path_error(error: PathError) -> WatchmanError {
+    match error {
+        PathError::HomeUnavailable => WatchmanError::HomeUnavailable,
+        PathError::UnsupportedTilde(path) => WatchmanError::UnsupportedTilde(path),
+        PathError::ParentDir(path) => WatchmanError::UnsafeWatchPath(path),
+        PathError::Io { path, source } => {
+            WatchmanError::io("make watch path absolute", path, source)
+        }
     }
 }
 
@@ -480,6 +473,8 @@ pub enum WatchmanError {
     HomeUnavailable,
     #[error("unsupported ~user path {0:?}")]
     UnsupportedTilde(String),
+    #[error("watch path must not contain ..: {}", .0.display())]
+    UnsafeWatchPath(PathBuf),
     #[error("invalid watch pattern {pattern:?}: {message}")]
     Pattern { pattern: String, message: String },
     #[error("unsafe Watchman path name {0:?}")]
@@ -607,6 +602,33 @@ rules:
         let candidates = parse_watchman_stdin(input, "/watch/root", watch).unwrap();
 
         assert_eq!(candidates, vec![PathBuf::from("/watch/root/statement.pdf")]);
+    }
+
+    #[test]
+    fn rejects_parent_components_in_watch_paths() {
+        let config = parse_config_str(
+            r#"
+version: 1
+watch:
+  paths:
+    - ../inbox
+rules:
+  - id: pdfs
+    when: file.ext == ".pdf"
+    actions:
+      - move:
+          to: "~/Documents/{{ file.name }}"
+"#,
+        )
+        .unwrap();
+        let options = WatchmanGenerateOptions::new(
+            PathBuf::from("/tmp/alder.yaml"),
+            PathBuf::from("/bin/alder"),
+        );
+
+        let error = generate_trigger_commands(&config, &options).unwrap_err();
+
+        assert!(matches!(error, WatchmanError::UnsafeWatchPath(_)));
     }
 
     #[test]

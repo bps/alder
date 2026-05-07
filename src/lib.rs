@@ -2,6 +2,7 @@ pub mod config;
 pub mod execute;
 pub mod expr;
 pub mod facts;
+pub mod path_utils;
 pub mod pipeline;
 pub mod planning;
 pub mod render;

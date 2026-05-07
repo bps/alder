@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use indexmap::IndexMap;
@@ -12,6 +12,7 @@ use crate::expr::{self, Value};
 use crate::facts::file::FileFacts;
 use crate::facts::pdf::PdfTextProvider;
 use crate::facts::spotlight::SpotlightProvider;
+use crate::path_utils::{PathError, expand_user_path};
 use crate::planning::{Explanation, plan_for_file};
 
 #[derive(Debug, Clone, Serialize)]
@@ -261,7 +262,10 @@ pub fn destination_roots(config: &Config) -> Result<Vec<PathBuf>, String> {
         .map(|defaults| defaults.destination_roots.as_slice())
         .unwrap_or(&[]);
 
-    roots.iter().map(|root| expand_config_path(root)).collect()
+    roots
+        .iter()
+        .map(|root| expand_user_path(root).map_err(destination_root_error))
+        .collect()
 }
 
 fn process_file(config: &Config, source: PathBuf, options: &ProcessOptions) -> PipelineResult {
@@ -391,36 +395,15 @@ fn system_time_string(time: SystemTime) -> String {
     }
 }
 
-fn expand_config_path(path: &str) -> Result<PathBuf, String> {
-    let expanded = if path == "~" || path.starts_with("~/") {
-        let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not available".to_string())?;
-        if path == "~" {
-            PathBuf::from(home)
-        } else {
-            PathBuf::from(home).join(&path[2..])
+fn destination_root_error(error: PathError) -> String {
+    match error {
+        PathError::HomeUnavailable => "HOME is not available".to_string(),
+        PathError::UnsupportedTilde(path) => format!("unsupported ~user path {path:?}"),
+        PathError::ParentDir(path) => {
+            format!("destination root must not contain ..: {}", path.display())
         }
-    } else if path.starts_with('~') {
-        return Err(format!("unsupported ~user path {path:?}"));
-    } else {
-        PathBuf::from(path)
-    };
-
-    if expanded
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
-        return Err(format!(
-            "destination root must not contain ..: {}",
-            expanded.display()
-        ));
+        PathError::Io { path, source } => format!("failed to resolve {}: {source}", path.display()),
     }
-
-    Ok(if expanded.is_absolute() {
-        expanded
-    } else {
-        std::path::absolute(&expanded)
-            .map_err(|error| format!("failed to resolve {}: {error}", expanded.display()))?
-    })
 }
 
 #[cfg(test)]
