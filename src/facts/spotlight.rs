@@ -1,18 +1,16 @@
 use std::ffi::OsString;
-use std::fs::{self, File};
-use std::io;
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::fs::File;
+use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
 
 use indexmap::IndexMap;
 use plist::Value;
-use tempfile::{NamedTempFile, TempPath};
 use thiserror::Error;
 
+use super::external::{self, ExternalCommand, ExternalError};
+
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_ATTRIBUTES: &[&str] = &[
     "kMDItemWhereFroms",
     "kMDItemTextContent",
@@ -22,18 +20,16 @@ const DEFAULT_ATTRIBUTES: &[&str] = &[
 
 #[derive(Debug, Clone)]
 pub struct SpotlightProvider {
-    command: OsString,
+    command: ExternalCommand,
     attrs: Vec<String>,
-    timeout: Duration,
     require_macos: bool,
 }
 
 impl SpotlightProvider {
     pub fn new(command: impl Into<OsString>, attrs: Vec<String>, timeout: Duration) -> Self {
         Self {
-            command: command.into(),
+            command: ExternalCommand::new(command, timeout),
             attrs,
-            timeout,
             require_macos: false,
         }
     }
@@ -46,37 +42,20 @@ impl SpotlightProvider {
         let input = path
             .as_ref()
             .canonicalize()
-            .map_err(|error| SpotlightError::io("canonicalize input", path.as_ref(), error))?;
-        let stdout_path = temp_path().map_err(|error| SpotlightError::tempfile("stdout", error))?;
-        let stderr_path = temp_path().map_err(|error| SpotlightError::tempfile("stderr", error))?;
+            .map_err(|error| ExternalError::io("canonicalize input", path.as_ref(), error))?;
+        let stdout_path = external::temp_path("stdout")?;
         let stdout_file = File::create(&stdout_path)
-            .map_err(|error| SpotlightError::io("create stdout tempfile", &stdout_path, error))?;
-        let stderr_file = File::create(&stderr_path)
-            .map_err(|error| SpotlightError::io("create stderr tempfile", &stderr_path, error))?;
+            .map_err(|error| ExternalError::io("create stdout tempfile", &stdout_path, error))?;
 
-        let mut command = Command::new(&self.command);
-        command.arg("-plist").arg("-");
-        for attr in &self.attrs {
-            command.arg("-name").arg(attr);
-        }
-        command
-            .arg(&input)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout_file))
-            .stderr(Stdio::from(stderr_file));
+        self.command.run(|command| {
+            command.arg("-plist").arg("-");
+            for attr in &self.attrs {
+                command.arg("-name").arg(attr);
+            }
+            command.arg(&input).stdout(Stdio::from(stdout_file));
+        })?;
 
-        let mut child = command
-            .spawn()
-            .map_err(|error| SpotlightError::spawn(self.command.clone(), error))?;
-        let status = wait_with_timeout(&mut child, self.timeout)?;
-        let stderr = read_lossy(&stderr_path).unwrap_or_default();
-
-        if !status.success() {
-            return Err(SpotlightError::Exit { status, stderr });
-        }
-
-        let bytes = fs::read(&stdout_path)
-            .map_err(|error| SpotlightError::io("read mdls plist output", &stdout_path, error))?;
+        let bytes = external::read(&stdout_path, "read mdls plist output")?;
         let value = Value::from_reader_xml(bytes.as_slice()).map_err(SpotlightError::ParsePlist)?;
         let dictionary = value
             .as_dictionary()
@@ -94,12 +73,11 @@ impl SpotlightProvider {
 impl Default for SpotlightProvider {
     fn default() -> Self {
         Self {
-            command: "mdls".into(),
+            command: ExternalCommand::new("mdls", DEFAULT_TIMEOUT),
             attrs: DEFAULT_ATTRIBUTES
                 .iter()
                 .map(|attr| (*attr).to_string())
                 .collect(),
-            timeout: DEFAULT_TIMEOUT,
             require_macos: true,
         }
     }
@@ -109,86 +87,21 @@ impl Default for SpotlightProvider {
 pub enum SpotlightError {
     #[error("Spotlight mdls provider is only available on macOS")]
     Unavailable,
-    #[error("failed to {op} for {}: {source}", path.display())]
-    Io {
-        op: &'static str,
-        path: PathBuf,
-        source: io::Error,
-    },
-    #[error("failed to create {purpose} tempfile: {source}")]
-    TempFile {
-        purpose: &'static str,
-        source: io::Error,
-    },
-    #[error("failed to spawn {command:?}: {source}")]
-    Spawn {
-        command: OsString,
-        source: io::Error,
-    },
-    #[error("mdls timed out after {timeout:?}")]
-    Timeout { timeout: Duration },
-    #[error("mdls exited with {status}: {}", stderr.trim())]
-    Exit { status: ExitStatus, stderr: String },
+    #[error(transparent)]
+    External(#[from] ExternalError),
     #[error("failed to parse mdls plist output: {0}")]
     ParsePlist(#[source] plist::Error),
     #[error("mdls plist output was not a dictionary")]
     UnexpectedPlistRoot,
 }
 
-impl SpotlightError {
-    fn io(op: &'static str, path: impl AsRef<Path>, source: io::Error) -> Self {
-        Self::Io {
-            op,
-            path: path.as_ref().to_path_buf(),
-            source,
-        }
-    }
-
-    fn tempfile(purpose: &'static str, source: io::Error) -> Self {
-        Self::TempFile { purpose, source }
-    }
-
-    fn spawn(command: OsString, source: io::Error) -> Self {
-        Self::Spawn { command, source }
-    }
-}
-
-fn wait_with_timeout(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> Result<ExitStatus, SpotlightError> {
-    let deadline = Instant::now() + timeout;
-
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| SpotlightError::io("wait for mdls", "mdls", error))?
-        {
-            return Ok(status);
-        }
-
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(SpotlightError::Timeout { timeout });
-        }
-
-        thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
-    }
-}
-
-fn temp_path() -> io::Result<TempPath> {
-    Ok(NamedTempFile::new()?.into_temp_path())
-}
-
-fn read_lossy(path: impl AsRef<Path>) -> io::Result<String> {
-    let bytes = fs::read(path)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use super::super::external::ExternalError;
+    use std::fs;
+    use std::path::PathBuf;
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -258,7 +171,10 @@ exit 3
 
         let error = provider.facts(&input).unwrap_err();
 
-        assert!(matches!(error, SpotlightError::Exit { .. }));
+        assert!(matches!(
+            error,
+            SpotlightError::External(ExternalError::Exit { .. })
+        ));
         assert!(error.to_string().contains("metadata unavailable"));
     }
 
@@ -282,7 +198,10 @@ sleep 2
 
         let error = provider.facts(&input).unwrap_err();
 
-        assert!(matches!(error, SpotlightError::Timeout { .. }));
+        assert!(matches!(
+            error,
+            SpotlightError::External(ExternalError::Timeout { .. })
+        ));
     }
 
     #[cfg(not(target_os = "macos"))]
