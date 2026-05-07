@@ -42,6 +42,9 @@ pub enum PlannedAction {
         conflict: ConflictPolicy,
         terminal: bool,
     },
+    Trash {
+        terminal: bool,
+    },
 }
 
 pub fn plan_for_file(
@@ -123,6 +126,7 @@ fn build_plan(
                     terminal: true,
                 });
             }
+            Action::Trash(_) => planned_actions.push(PlannedAction::Trash { terminal: true }),
             other => return Err(PlanError::UnsupportedAction(other.kind_name())),
         }
     }
@@ -269,6 +273,29 @@ rules:
                 conflict: ConflictPolicy::AppendCounter,
                 terminal: true,
             }
+        );
+    }
+
+    #[test]
+    fn plans_trash_action() {
+        let config = parse_config_str(
+            r#"
+version: 1
+rules:
+  - id: old-downloads
+    when: file.ext == ".tmp"
+    actions:
+      - trash: {}
+"#,
+        )
+        .unwrap();
+        let facts = facts([("file.ext", ".tmp")]);
+
+        let explanation = plan_for_file(&config, "/tmp/file.tmp", &facts).unwrap();
+
+        assert_eq!(
+            explanation.plan.unwrap().actions[0],
+            PlannedAction::Trash { terminal: true }
         );
     }
 

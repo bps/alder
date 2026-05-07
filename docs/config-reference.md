@@ -76,7 +76,7 @@ Fields:
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `conflict` | conflict policy | `append_counter` in planning | Used by move actions unless action-level `conflict` is set. |
-| `destination_roots` | list of strings | `[]` | Required for non-dry-run execution. Destinations must remain inside these roots. |
+| `destination_roots` | list of strings | `[]` | Required for non-dry-run `move` execution. Move destinations must remain inside these roots. Not required for `trash`. |
 | `unmatched.move_to` | string | unset | Parsed for design compatibility; not yet executed as a fallback action. |
 
 Conflict policies:
@@ -110,7 +110,7 @@ Fields:
 | `name` | string | unset | Human-readable label. |
 | `when` | expression string | required | Provisional CEL-like expression. Must evaluate to bool. |
 | `extract` | map | `{}` | Regex extractors keyed by variable name. |
-| `actions` | list | required non-empty | Currently only `move` is executed. Other action shapes parse but planning reports unsupported. |
+| `actions` | list | required non-empty | Currently `move` and `trash` are executed. Other action shapes parse but planning reports unsupported. |
 
 ## Expressions
 
@@ -177,7 +177,7 @@ Template safety:
 - unknown variables error;
 - untrusted variable values may not contain path separators, NULs, or control characters;
 - rendered paths may not contain `..`;
-- non-dry-run destinations must remain under `defaults.destination_roots`.
+- non-dry-run move destinations must remain under `defaults.destination_roots`.
 
 ## Move action
 
@@ -195,7 +195,30 @@ Fields:
 | `to` | template string | required |
 | `conflict` | conflict policy | `defaults.conflict`, then `append_counter` |
 
-Only `move` is executed by the current CLI pipeline.
+## Trash action
+
+```yaml
+actions:
+  - trash: {}
+```
+
+`trash` has no fields today. `trash: {}` and `trash:` both parse as the same empty action.
+
+Trash actions move the source file to the operating system's Trash or Recycle Bin instead of deleting it or moving it to an Alder-managed folder. Alder uses platform trash mechanics:
+
+- macOS uses Finder-compatible trash behavior where possible, so files appear in the user's Trash and can normally be restored with Finder's Put Back behavior.
+- Linux follows FreeDesktop.org Trash behavior through the platform trash implementation.
+- Windows uses Recycle Bin semantics through the platform trash implementation.
+
+Safety behavior:
+
+- dry-runs produce a planned `trash` execution record and do not mutate the filesystem or action log;
+- non-dry-run trash validates that the source is a regular non-symlink file;
+- trash actions append explicit action-log records with source sizes for audit;
+- `defaults.destination_roots` is not required because there is no Alder destination path to validate;
+- `alder undo` does not automatically restore trash actions. Restore from the operating system Trash/Recycle Bin. If the latest action is `trash`, `alder undo` refuses rather than reaching past it to undo an older move.
+
+`move` and `trash` are executed by the current CLI pipeline.
 
 Other parsed action shapes:
 

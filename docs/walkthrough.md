@@ -49,7 +49,7 @@ rules:
           to: "./tmp/sorted/{{ file.name }}"
 ```
 
-`defaults.destination_roots` is required for non-dry-run execution. It is the filesystem safety boundary for moves.
+`defaults.destination_roots` is required for non-dry-run move execution. It is the filesystem safety boundary for moves; `trash` actions use the operating system Trash/Recycle Bin and do not need a destination root.
 
 ## Dry-run a file
 

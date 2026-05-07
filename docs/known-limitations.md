@@ -6,11 +6,11 @@ This document separates intentional scope boundaries from planned gaps and exter
 
 ### Alder is not a general automation platform
 
-The current implementation focuses on explainable move-based file routing. It intentionally does not provide arbitrary shell/Python actions, notifications, or broad workflow orchestration.
+The current implementation focuses on explainable file routing. It intentionally does not provide arbitrary shell/Python actions, notifications, or broad workflow orchestration.
 
-### Move is the only executed action
+### Only move and trash actions execute
 
-The config schema can parse other actions, but only `move` is planned and executed today. Unsupported actions fail during planning.
+The config schema can parse other actions, but only `move` and `trash` are planned and executed today. Unsupported actions fail during planning.
 
 ### Destination roots are required for execution
 
@@ -19,6 +19,14 @@ Non-dry-run moves require `defaults.destination_roots`. This is deliberate. Alde
 ### Dedupe is not undoable
 
 `replace_if_same_hash` removes the source only after proving the destination already has the same size and hash. The destination is never deleted or overwritten. Because this is duplicate-source removal, `alder undo` does not recreate deduped sources.
+
+### Trash undo
+
+`trash` actions use the operating system Trash/Recycle Bin and are intended to be restored there. Alder logs trash actions for audit, but `alder undo` does not automatically restore them. If the latest action is `trash`, undo refuses rather than guessing or reaching past it to undo an older move.
+
+Trash behavior depends on the host OS and user environment. Headless/minimal Linux environments need a writable FreeDesktop-style trash location; removable, network, or unusual filesystems may fail or have platform-specific Recycle Bin behavior; and macOS protected locations may require appropriate user permissions. Alder reports the platform trash error and leaves the source in place when the trash operation fails.
+
+If Alder exits after logging a trash intent but before logging success or failure, reconciliation can report the orphaned in-progress record but cannot always prove whether the OS completed the trash operation. Check the source path and the OS Trash/Recycle Bin manually in that case.
 
 ### Watchman is a candidate detector
 

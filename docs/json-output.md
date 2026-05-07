@@ -77,9 +77,12 @@ Execution statuses currently include:
 - `skipped`
 - `failed`
 - `deduped`
+- `trashed`
 - `undone`
 
 For dry-runs, execution records use `planned` and no filesystem mutation occurs.
+
+Trash execution records use `action: "trash"`. They have no Alder destination path, so `destination` is `null`; the `reason` explains that the source is moved to the operating system Trash/Recycle Bin. Trash records include the source size but leave `sha256` as `null` to avoid hashing large files when Alder will not use the hash for automatic restore.
 
 ## `facts --json`
 
@@ -164,12 +167,19 @@ The key invariants are:
 
 ## Action log JSONL
 
-The action log is append-only JSONL, not the same as CLI JSON output.
+The action log is append-only JSONL, not the same as CLI JSON output. New records use `schema_version = 2`; Alder can still read earlier `schema_version = 1` move records.
 
 Move execution writes at least:
 
 1. `action = "move", status = "in_progress"`
 2. `action = "move", status = "moved"`
+
+Trash execution writes at least:
+
+1. `action = "trash", status = "in_progress"`
+2. `action = "trash", status = "trashed"`
+
+If the platform trash operation fails after Alder writes the intent record, Alder appends `action = "trash", status = "failed"` before returning the error.
 
 Undo writes:
 
@@ -181,3 +191,5 @@ Hash dedupe writes:
 - `action = "move", status = "deduped"`
 
 Each action log record includes a per-action `action_id` for pairing and reconciliation.
+
+Trash action-log records use `to: null` because the final Trash/Recycle Bin location is owned by the operating system. Restore trash actions from the OS Trash/Recycle Bin; `alder undo` refuses when the latest action is `trash` rather than guessing or reaching past it.

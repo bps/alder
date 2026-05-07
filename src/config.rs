@@ -112,6 +112,7 @@ pub enum Action {
     Copy(DestinationAction),
     Rename(DestinationAction),
     Tag(TagAction),
+    Trash(#[serde(default)] TrashAction),
     Review(#[serde(default)] ReviewAction),
     MoveToReview(#[serde(default)] MoveToReviewAction),
 }
@@ -123,6 +124,7 @@ impl Action {
             Action::Copy(_) => "copy",
             Action::Rename(_) => "rename",
             Action::Tag(_) => "tag",
+            Action::Trash(_) => "trash",
             Action::Review(_) => "review",
             Action::MoveToReview(_) => "move_to_review",
         }
@@ -143,6 +145,10 @@ pub struct DestinationAction {
 pub struct TagAction {
     pub tags: Vec<String>,
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrashAction {}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -387,6 +393,8 @@ rules:
       - move_to_review:
       - move_to_review:
           to: ~/Documents/Review/{{ file.name }}
+      - trash: {}
+      - trash:
       - tag:
           tags:
             - tax
@@ -395,7 +403,7 @@ rules:
         )
         .unwrap();
 
-        assert_eq!(config.rules[0].actions.len(), 5);
+        assert_eq!(config.rules[0].actions.len(), 7);
         match &config.rules[0].actions[0] {
             Action::Review(action) => assert_eq!(action, &ReviewAction::default()),
             other => panic!("expected review action, got {other:?}"),
@@ -422,6 +430,14 @@ rules:
             }
             other => panic!("expected move_to_review action, got {other:?}"),
         }
-        assert!(matches!(config.rules[0].actions[4], Action::Tag(_)));
+        match &config.rules[0].actions[4] {
+            Action::Trash(action) => assert_eq!(action, &TrashAction::default()),
+            other => panic!("expected trash action, got {other:?}"),
+        }
+        match &config.rules[0].actions[5] {
+            Action::Trash(action) => assert_eq!(action, &TrashAction::default()),
+            other => panic!("expected trash action, got {other:?}"),
+        }
+        assert!(matches!(config.rules[0].actions[6], Action::Tag(_)));
     }
 }

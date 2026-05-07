@@ -145,6 +145,42 @@ fn run_moves_and_logs() {
 }
 
 #[test]
+fn trash_only_config_does_not_require_destination_roots() {
+    let temp = tempfile::tempdir().unwrap();
+    let inbox = temp.path().join("inbox");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&inbox).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let config = temp.path().join("alder.yaml");
+    fs::write(
+        &config,
+        r#"
+version: 1
+rules:
+  - id: trash-tmp
+    when: file.ext == ".tmp"
+    actions:
+      - trash: {}
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(alder())
+        .env("HOME", &home)
+        .arg("--config")
+        .arg(&config)
+        .arg("--json")
+        .arg("run")
+        .arg(&inbox)
+        .output()
+        .expect("failed to execute sandbox command");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 0);
+}
+
+#[test]
 fn undo_last_restores_last_move() {
     let sandbox = Sandbox::new();
     let source = sandbox.with_pdf("statement.pdf");

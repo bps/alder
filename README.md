@@ -22,13 +22,14 @@ Alder can currently:
 - extract regex variables and render safe destination templates;
 - dry-run and explain move plans;
 - execute safe move actions inside explicit destination roots;
+- execute OS-specific trash actions using the user's Trash/Recycle Bin;
 - handle conflicts including `append_counter` and `replace_if_same_hash`;
 - append action-log records;
 - conservatively undo the last move;
 - generate and sync Watchman triggers that invoke Alder directly;
 - run e2e CLI tests for the main workflow.
 
-The implementation is still a prototype. The expression engine is provisional, JSON output is not yet versioned, and only move actions are executed.
+The implementation is still a prototype. The expression engine is provisional, JSON output is not yet versioned, and only move and trash actions are executed.
 
 ## Documentation
 

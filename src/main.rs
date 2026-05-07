@@ -6,7 +6,7 @@ use std::{env, fs, io};
 use clap::CommandFactory;
 use clap::{Args, Parser, Subcommand};
 
-use alder::config::parse_config_str;
+use alder::config::{Action, Config, parse_config_str};
 use alder::execute::undo_last_move;
 use alder::pipeline::{
     ProcessOptions, destination_roots, explain_file, facts_for_file, process_paths,
@@ -176,7 +176,7 @@ fn run_paths(
     let config_path = resolve_config_path(config_path)?;
     let config = load_config(&config_path)?;
     let roots = destination_roots(&config)?;
-    if !dry_run && roots.is_empty() {
+    if !dry_run && roots.is_empty() && config_needs_destination_roots(&config) {
         return Err(
             "non-dry-run execution requires defaults.destination_roots in config".to_string(),
         );
@@ -228,7 +228,7 @@ fn parse_watchman_ingest(
     let candidates =
         parse_watchman_stdin(&input, root, watch).map_err(|error| error.to_string())?;
     let roots = destination_roots(&config)?;
-    if !dry_run && roots.is_empty() {
+    if !dry_run && roots.is_empty() && config_needs_destination_roots(&config) {
         return Err(
             "non-dry-run execution requires defaults.destination_roots in config".to_string(),
         );
@@ -356,6 +356,14 @@ fn load_config(path: &Path) -> Result<alder::config::Config, String> {
     parse_config_str(&input).map_err(|error| error.to_string())
 }
 
+fn config_needs_destination_roots(config: &Config) -> bool {
+    // Keep this in sync with planning's MVP rule: only the first action is planned.
+    config
+        .rules
+        .iter()
+        .any(|rule| matches!(rule.actions.first(), Some(Action::Move(_))))
+}
+
 fn default_action_log_path() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
@@ -421,12 +429,21 @@ fn print_human_result(result: &alder::pipeline::PipelineResult) {
     }
     if let Some(execution) = &result.execution {
         for record in &execution.records {
-            println!(
-                "  Executed {}: {:?} -> {}",
-                record.action,
-                record.status,
-                record.destination.display()
-            );
+            if let Some(destination) = &record.destination {
+                println!(
+                    "  Executed {}: {:?} -> {}",
+                    record.action,
+                    record.status,
+                    destination.display()
+                );
+            } else if let Some(reason) = &record.reason {
+                println!(
+                    "  Executed {}: {:?} ({reason})",
+                    record.action, record.status
+                );
+            } else {
+                println!("  Executed {}: {:?}", record.action, record.status);
+            }
         }
     }
     if let Some(error) = &result.error {
