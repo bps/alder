@@ -124,11 +124,7 @@ fn build_plan(
                 });
                 break;
             }
-            Action::Copy(_) => return Err(PlanError::UnsupportedAction("copy")),
-            Action::Rename(_) => return Err(PlanError::UnsupportedAction("rename")),
-            Action::Tag(_) => return Err(PlanError::UnsupportedAction("tag")),
-            Action::Review(_) => return Err(PlanError::UnsupportedAction("review")),
-            Action::MoveToReview(_) => return Err(PlanError::UnsupportedAction("move_to_review")),
+            other => return Err(PlanError::UnsupportedAction(other.kind_name())),
         }
     }
 

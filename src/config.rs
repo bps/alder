@@ -116,6 +116,19 @@ pub enum Action {
     MoveToReview(#[serde(deserialize_with = "deserialize_default_from_null")] MoveToReviewAction),
 }
 
+impl Action {
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Action::Move(_) => "move",
+            Action::Copy(_) => "copy",
+            Action::Rename(_) => "rename",
+            Action::Tag(_) => "tag",
+            Action::Review(_) => "review",
+            Action::MoveToReview(_) => "move_to_review",
+        }
+    }
+}
+
 fn deserialize_default_from_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
