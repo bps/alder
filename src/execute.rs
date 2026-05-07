@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -30,7 +31,7 @@ pub struct ExecutionReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutionRecord {
-    pub action: String,
+    pub action: ActionKind,
     pub source: PathBuf,
     pub destination: PathBuf,
     pub status: ExecutionStatus,
@@ -38,6 +39,28 @@ pub struct ExecutionRecord {
     pub rule_id: String,
     pub sha256: Option<String>,
     pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    Move,
+    UndoMove,
+}
+
+impl ActionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Move => "move",
+            Self::UndoMove => "undo_move",
+        }
+    }
+}
+
+impl fmt::Display for ActionKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,7 +85,7 @@ struct ActionLogRecord {
     undoes_action_id: Option<String>,
     run_id: String,
     rule_id: String,
-    action: String,
+    action: ActionKind,
     status: ExecutionStatus,
     from: PathBuf,
     to: PathBuf,
@@ -102,7 +125,7 @@ fn planned_record(
 ) -> Result<ExecutionRecord, ExecuteError> {
     match action {
         PlannedAction::Move { to, .. } => Ok(ExecutionRecord {
-            action: "move".to_string(),
+            action: ActionKind::Move,
             source: plan.source.clone(),
             destination: resolve_destination(to)?,
             status: ExecutionStatus::Planned,
@@ -149,7 +172,7 @@ fn execute_move(
     match conflict {
         ConflictPolicy::Skip if requested_destination.exists() => {
             return Ok(ExecutionRecord {
-                action: "move".to_string(),
+                action: ActionKind::Move,
                 source,
                 destination: requested_destination,
                 status: ExecutionStatus::Skipped,
@@ -161,7 +184,7 @@ fn execute_move(
         }
         ConflictPolicy::Review if requested_destination.exists() => {
             return Ok(ExecutionRecord {
-                action: "move".to_string(),
+                action: ActionKind::Move,
                 source,
                 destination: requested_destination,
                 status: ExecutionStatus::Skipped,
@@ -182,7 +205,7 @@ fn execute_move(
         None,
         &options.run_id,
         &plan.rule_id,
-        "move",
+        ActionKind::Move,
         ExecutionStatus::InProgress,
         &source,
         &destination,
@@ -205,7 +228,7 @@ fn execute_move(
         None,
         &options.run_id,
         &plan.rule_id,
-        "move",
+        ActionKind::Move,
         ExecutionStatus::Moved,
         &source,
         &destination,
@@ -216,7 +239,7 @@ fn execute_move(
     log.append(&committed)?;
 
     Ok(ExecutionRecord {
-        action: "move".to_string(),
+        action: ActionKind::Move,
         source,
         destination,
         status: ExecutionStatus::Moved,
@@ -267,7 +290,7 @@ fn dedupe_if_same_hash(
         None,
         &options.run_id,
         &plan.rule_id,
-        "move",
+        ActionKind::Move,
         ExecutionStatus::Deduped,
         &source,
         destination,
@@ -278,7 +301,7 @@ fn dedupe_if_same_hash(
     log.append(&record)?;
 
     Ok(ExecutionRecord {
-        action: "move".to_string(),
+        action: ActionKind::Move,
         source,
         destination: destination.to_path_buf(),
         status: ExecutionStatus::Deduped,
@@ -483,7 +506,7 @@ pub struct UndoReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReconcileFinding {
     pub action_id: String,
-    pub action: String,
+    pub action: ActionKind,
     pub from: PathBuf,
     pub to: PathBuf,
     pub status: ExecutionStatus,
@@ -530,7 +553,7 @@ pub fn undo_last_move(action_log_path: &Path) -> Result<UndoReport, ExecuteError
         Some(record.action_id.clone()),
         &record.run_id,
         &record.rule_id,
-        "undo_move",
+        ActionKind::UndoMove,
         ExecutionStatus::InProgress,
         &record.to,
         &record.from,
@@ -547,7 +570,7 @@ pub fn undo_last_move(action_log_path: &Path) -> Result<UndoReport, ExecuteError
         Some(record.action_id.clone()),
         &record.run_id,
         &record.rule_id,
-        "undo_move",
+        ActionKind::UndoMove,
         ExecutionStatus::Undone,
         &record.to,
         &record.from,
@@ -574,7 +597,9 @@ pub fn reconcile_action_log(action_log_path: &Path) -> Result<Vec<ReconcileFindi
 fn latest_unundone_move(records: &[ActionLogRecord]) -> Option<ActionLogRecord> {
     let undone: std::collections::HashSet<&str> = records
         .iter()
-        .filter(|record| record.action == "undo_move" && record.status == ExecutionStatus::Undone)
+        .filter(|record| {
+            record.action == ActionKind::UndoMove && record.status == ExecutionStatus::Undone
+        })
         .filter_map(|record| record.undoes_action_id.as_deref())
         .collect();
 
@@ -582,7 +607,7 @@ fn latest_unundone_move(records: &[ActionLogRecord]) -> Option<ActionLogRecord> 
         .iter()
         .rev()
         .find(|record| {
-            record.action == "move"
+            record.action == ActionKind::Move
                 && record.status == ExecutionStatus::Moved
                 && !undone.contains(record.action_id.as_str())
         })
@@ -604,7 +629,7 @@ fn reconcile_records(records: &[ActionLogRecord]) -> Vec<ReconcileFinding> {
         })
         .map(|record| ReconcileFinding {
             action_id: record.action_id.clone(),
-            action: record.action.clone(),
+            action: record.action,
             from: record.from.clone(),
             to: record.to.clone(),
             status: record.status.clone(),
@@ -619,7 +644,7 @@ impl ActionLogRecord {
         undoes_action_id: Option<String>,
         run_id: &str,
         rule_id: &str,
-        action: &str,
+        action: ActionKind,
         status: ExecutionStatus,
         from: &Path,
         to: &Path,
@@ -637,7 +662,7 @@ impl ActionLogRecord {
             undoes_action_id,
             run_id: run_id.to_string(),
             rule_id: rule_id.to_string(),
-            action: action.to_string(),
+            action,
             status,
             from: from.to_path_buf(),
             to: to.to_path_buf(),
@@ -717,6 +742,26 @@ mod tests {
     use super::*;
     use crate::planning::{ActionPlan, PlannedAction};
     use indexmap::IndexMap;
+
+    #[test]
+    fn action_kind_uses_existing_json_names() {
+        assert_eq!(
+            serde_json::to_string(&ActionKind::Move).unwrap(),
+            r#""move""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ActionKind::UndoMove).unwrap(),
+            r#""undo_move""#
+        );
+        assert_eq!(
+            serde_json::from_str::<ActionKind>(r#""move""#).unwrap(),
+            ActionKind::Move
+        );
+        assert_eq!(
+            serde_json::from_str::<ActionKind>(r#""undo_move""#).unwrap(),
+            ActionKind::UndoMove
+        );
+    }
 
     #[test]
     fn dry_run_does_not_move_or_log() {
@@ -950,7 +995,7 @@ mod tests {
             None,
             "run",
             "rule",
-            "move",
+            ActionKind::Move,
             ExecutionStatus::InProgress,
             Path::new("/from"),
             Path::new("/to"),
