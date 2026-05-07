@@ -709,8 +709,6 @@ pub enum ExecuteError {
     },
     #[error("source and destination are the same path: {}", .0.display())]
     SameSourceDestination(PathBuf),
-    #[error("conflict policy {0:?} is not supported by execution yet")]
-    UnsupportedConflict(ConflictPolicy),
     #[error("nothing to undo")]
     NothingToUndo,
     #[error("undo refused: {0}")]
