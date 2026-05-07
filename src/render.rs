@@ -296,6 +296,7 @@ pub enum RenderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{extractors, fact_strings, vars};
 
     #[test]
     fn extracts_first_capture_group() {
@@ -307,10 +308,7 @@ mod tests {
                 format: None,
             },
         )]);
-        let facts = facts([(
-            "pdf.text",
-            "American Express Closing Date 04/15/2026".to_string(),
-        )]);
+        let facts = fact_strings([("pdf.text", "American Express Closing Date 04/15/2026")]);
 
         let variables = extract_variables(&extractors, &facts).unwrap();
 
@@ -327,7 +325,7 @@ mod tests {
                 format: None,
             },
         )]);
-        let facts = facts([("pdf.text", "Closing Date 2026-04-15".to_string())]);
+        let facts = fact_strings([("pdf.text", "Closing Date 2026-04-15")]);
 
         let variables = extract_variables(&extractors, &facts).unwrap();
 
@@ -360,7 +358,7 @@ mod tests {
                 format: None,
             },
         )]);
-        let facts = facts([("pdf.text", "no date here".to_string())]);
+        let facts = fact_strings([("pdf.text", "no date here")]);
 
         let error = extract_variables(&extractors, &facts).unwrap_err();
 
@@ -377,7 +375,7 @@ mod tests {
                 format: Some("%m/%d/%Y".to_string()),
             },
         )]);
-        let facts = facts([("pdf.text", "Closing Date 04/15/2026".to_string())]);
+        let facts = fact_strings([("pdf.text", "Closing Date 04/15/2026")]);
 
         let variables = extract_variables(&extractors, &facts).unwrap();
 
@@ -394,7 +392,7 @@ mod tests {
                 format: Some("%m/%d/%Y".to_string()),
             },
         )]);
-        let facts = facts([("pdf.text", "Closing Date nope".to_string())]);
+        let facts = fact_strings([("pdf.text", "Closing Date nope")]);
 
         let error = extract_variables(&extractors, &facts).unwrap_err();
 
@@ -508,26 +506,5 @@ mod tests {
     fn sanitizes_path_segment_when_callers_choose_sanitization() {
         assert_eq!(sanitize_path_segment("../../evil\0.pdf"), ".._.._evil_.pdf");
         assert_eq!(sanitize_path_segment(".."), "__");
-    }
-
-    fn extractors<const N: usize>(items: [(&str, Extractor); N]) -> IndexMap<String, Extractor> {
-        items
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value))
-            .collect()
-    }
-
-    fn facts<const N: usize>(items: [(&str, String); N]) -> FactStrings {
-        items
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value))
-            .collect()
-    }
-
-    fn vars<const N: usize>(items: [(&str, &str); N]) -> IndexMap<String, String> {
-        items
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value.to_string()))
-            .collect()
     }
 }

@@ -1,7 +1,8 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 use serde_json::Value;
 
@@ -73,11 +74,26 @@ rules:
         path
     }
 
+    fn with_pdf(&self, name: &str) -> PathBuf {
+        self.write_inbox(name, b"fake pdf")
+    }
+
     fn command(&self) -> Command {
         let mut command = Command::new(alder());
         command.env("HOME", &self.home);
         command.arg("--config").arg(&self.config);
         command
+    }
+
+    fn run<I, S>(&self, args: I) -> Output
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.command()
+            .args(args)
+            .output()
+            .expect("failed to execute sandbox command")
     }
 
     fn action_log(&self) -> PathBuf {
@@ -88,16 +104,14 @@ rules:
 #[test]
 fn dry_run_does_not_move_files() {
     let sandbox = Sandbox::new();
-    let source = sandbox.write_inbox("statement.pdf", b"fake pdf");
+    let source = sandbox.with_pdf("statement.pdf");
 
-    let output = sandbox
-        .command()
-        .arg("--json")
-        .arg("run")
-        .arg(&sandbox.inbox)
-        .arg("--dry-run")
-        .output()
-        .unwrap();
+    let output = sandbox.run([
+        OsStr::new("--json"),
+        OsStr::new("run"),
+        sandbox.inbox.as_os_str(),
+        OsStr::new("--dry-run"),
+    ]);
 
     assert!(output.status.success(), "{}", stderr(&output));
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -111,15 +125,13 @@ fn dry_run_does_not_move_files() {
 #[test]
 fn run_moves_and_logs() {
     let sandbox = Sandbox::new();
-    let source = sandbox.write_inbox("statement.pdf", b"fake pdf");
+    let source = sandbox.with_pdf("statement.pdf");
 
-    let output = sandbox
-        .command()
-        .arg("--json")
-        .arg("run")
-        .arg(&sandbox.inbox)
-        .output()
-        .unwrap();
+    let output = sandbox.run([
+        OsStr::new("--json"),
+        OsStr::new("run"),
+        sandbox.inbox.as_os_str(),
+    ]);
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(!source.exists());
@@ -135,22 +147,12 @@ fn run_moves_and_logs() {
 #[test]
 fn undo_last_restores_last_move() {
     let sandbox = Sandbox::new();
-    let source = sandbox.write_inbox("statement.pdf", b"fake pdf");
+    let source = sandbox.with_pdf("statement.pdf");
     let dest = sandbox.sorted.join("statement.pdf");
-    let run_output = sandbox
-        .command()
-        .arg("run")
-        .arg(&sandbox.inbox)
-        .output()
-        .unwrap();
+    let run_output = sandbox.run([OsStr::new("run"), sandbox.inbox.as_os_str()]);
     assert!(run_output.status.success(), "{}", stderr(&run_output));
 
-    let undo_output = sandbox
-        .command()
-        .arg("--json")
-        .arg("undo")
-        .output()
-        .unwrap();
+    let undo_output = sandbox.run(["--json", "undo"]);
 
     assert!(undo_output.status.success(), "{}", stderr(&undo_output));
     assert!(source.exists());
@@ -165,15 +167,13 @@ fn undo_last_restores_last_move() {
 #[test]
 fn facts_json_exposes_provider_reports() {
     let sandbox = Sandbox::new();
-    let source = sandbox.write_inbox("statement.pdf", b"fake pdf");
+    let source = sandbox.with_pdf("statement.pdf");
 
-    let output = sandbox
-        .command()
-        .arg("--json")
-        .arg("facts")
-        .arg(&source)
-        .output()
-        .unwrap();
+    let output = sandbox.run([
+        OsStr::new("--json"),
+        OsStr::new("facts"),
+        source.as_os_str(),
+    ]);
 
     assert!(output.status.success(), "{}", stderr(&output));
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -197,15 +197,13 @@ fn facts_json_exposes_provider_reports() {
 #[test]
 fn explain_json_includes_matched_rule_and_destination() {
     let sandbox = Sandbox::new();
-    let source = sandbox.write_inbox("statement.pdf", b"fake pdf");
+    let source = sandbox.with_pdf("statement.pdf");
 
-    let output = sandbox
-        .command()
-        .arg("--json")
-        .arg("explain")
-        .arg(&source)
-        .output()
-        .unwrap();
+    let output = sandbox.run([
+        OsStr::new("--json"),
+        OsStr::new("explain"),
+        source.as_os_str(),
+    ]);
 
     assert!(output.status.success(), "{}", stderr(&output));
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -226,12 +224,7 @@ fn explain_json_includes_matched_rule_and_destination() {
 fn watchman_print_generates_direct_alder_trigger() {
     let sandbox = Sandbox::new();
 
-    let output = sandbox
-        .command()
-        .arg("watchman")
-        .arg("print")
-        .output()
-        .unwrap();
+    let output = sandbox.run(["watchman", "print"]);
 
     assert!(output.status.success(), "{}", stderr(&output));
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -262,7 +255,7 @@ fn watchman_print_generates_direct_alder_trigger() {
 #[test]
 fn ingest_from_watchman_moves_only_matching_candidates() {
     let sandbox = Sandbox::new();
-    sandbox.write_inbox("statement.pdf", b"fake pdf");
+    sandbox.with_pdf("statement.pdf");
     sandbox.write_inbox("ignored.pdf.tmp", b"partial");
     sandbox.write_inbox("notes.txt", b"notes");
 

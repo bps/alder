@@ -184,6 +184,7 @@ pub enum PlanError {
 mod tests {
     use super::*;
     use crate::config::parse_config_str;
+    use crate::test_support::{facts, no_facts};
 
     #[test]
     fn plans_move_for_first_matching_rule() {
@@ -348,17 +349,10 @@ rules:
 "#,
         )
         .unwrap();
-        let facts = facts([]);
+        let facts = no_facts();
 
         let error = plan_for_file(&config, "/tmp/file.pdf", &facts).unwrap_err();
 
         assert!(matches!(error, PlanError::UnsupportedAction("review")));
-    }
-
-    fn facts<const N: usize>(items: [(&str, &str); N]) -> IndexMap<String, Value> {
-        items
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), Value::String(value.to_string())))
-            .collect()
     }
 }

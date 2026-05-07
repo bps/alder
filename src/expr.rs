@@ -522,6 +522,7 @@ fn token_name(token: &TokenKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::facts;
 
     #[test]
     fn evaluates_design_style_expression() {
@@ -622,12 +623,5 @@ mod tests {
             identifiers(r#"file.ext == ".pdf" && contains(pdf.text, "American Express")"#).unwrap();
 
         assert_eq!(ids, vec!["file.ext".to_string(), "pdf.text".to_string()]);
-    }
-
-    fn facts<const N: usize>(items: [(&str, Value); N]) -> IndexMap<String, Value> {
-        items
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value))
-            .collect()
     }
 }
