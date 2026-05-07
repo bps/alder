@@ -46,6 +46,7 @@ Design and background:
 - [`organize` comparison](docs/comparison-organize.md)
 - [Watchman integration](docs/watchman.md)
 - [CEL implementation evaluation](docs/cel-evaluation.md)
+- [Generic date extraction design](docs/date-extraction.md)
 - [Semantic type assessment](docs/semantic-types.md)
 - [End-to-end test plan](docs/e2e-tests.md)
 

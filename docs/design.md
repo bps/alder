@@ -169,6 +169,10 @@ rules:
           to: "~/Documents/Finance/Credit Cards/Amex/{{ statement_date | date('%Y') }}/{{ statement_date }} - Amex.pdf"
 ```
 
+A future first-class date extractor should reduce brittle per-issuer regexes for
+converted Hazel custom date tokens while preserving this explicit regex path. See
+[Generic date extraction design](date-extraction.md).
+
 ### Strict schema
 
 The parser should reject unknown keys by default. Silent config acceptance is dangerous in a file-moving tool.
