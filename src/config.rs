@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use indexmap::IndexMap;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -112,8 +112,8 @@ pub enum Action {
     Copy(DestinationAction),
     Rename(DestinationAction),
     Tag(TagAction),
-    Review(#[serde(deserialize_with = "deserialize_default_from_null")] ReviewAction),
-    MoveToReview(#[serde(deserialize_with = "deserialize_default_from_null")] MoveToReviewAction),
+    Review(#[serde(default)] ReviewAction),
+    MoveToReview(#[serde(default)] MoveToReviewAction),
 }
 
 impl Action {
@@ -127,14 +127,6 @@ impl Action {
             Action::MoveToReview(_) => "move_to_review",
         }
     }
-}
-
-fn deserialize_default_from_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de> + Default,
-{
-    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -393,6 +385,7 @@ rules:
       - review:
           reason: needs manual classification
       - move_to_review:
+      - move_to_review:
           to: ~/Documents/Review/{{ file.name }}
       - tag:
           tags:
@@ -402,13 +395,33 @@ rules:
         )
         .unwrap();
 
-        assert_eq!(config.rules[0].actions.len(), 4);
-        assert!(matches!(config.rules[0].actions[0], Action::Review(_)));
-        assert!(matches!(config.rules[0].actions[1], Action::Review(_)));
-        assert!(matches!(
-            config.rules[0].actions[2],
-            Action::MoveToReview(_)
-        ));
-        assert!(matches!(config.rules[0].actions[3], Action::Tag(_)));
+        assert_eq!(config.rules[0].actions.len(), 5);
+        match &config.rules[0].actions[0] {
+            Action::Review(action) => assert_eq!(action, &ReviewAction::default()),
+            other => panic!("expected review action, got {other:?}"),
+        }
+        match &config.rules[0].actions[1] {
+            Action::Review(action) => {
+                assert_eq!(
+                    action.reason.as_deref(),
+                    Some("needs manual classification")
+                );
+            }
+            other => panic!("expected review action, got {other:?}"),
+        }
+        match &config.rules[0].actions[2] {
+            Action::MoveToReview(action) => assert_eq!(action, &MoveToReviewAction::default()),
+            other => panic!("expected move_to_review action, got {other:?}"),
+        }
+        match &config.rules[0].actions[3] {
+            Action::MoveToReview(action) => {
+                assert_eq!(
+                    action.to.as_deref(),
+                    Some("~/Documents/Review/{{ file.name }}")
+                );
+            }
+            other => panic!("expected move_to_review action, got {other:?}"),
+        }
+        assert!(matches!(config.rules[0].actions[4], Action::Tag(_)));
     }
 }
