@@ -1,6 +1,7 @@
 use indexmap::IndexMap;
 use regex::Regex;
 use serde::Serialize;
+use std::{iter::Peekable, str::CharIndices};
 use thiserror::Error;
 
 /// Provisional CEL-like evaluator for the MVP.
@@ -39,7 +40,7 @@ fn parse(input: &str) -> Result<Expr, ExprError> {
     let tokens = Lexer::new(input).tokenize()?;
     let mut parser = Parser { tokens, pos: 0 };
     let expr = parser.parse_or()?;
-    parser.expect(TokenKind::Eof)?;
+    parser.expect(TokenTag::Eof)?;
     Ok(expr)
 }
 
@@ -245,18 +246,49 @@ enum TokenKind {
     Eof,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenTag {
+    Ident,
+    String,
+    Bool,
+    LParen,
+    RParen,
+    Comma,
+    And,
+    Or,
+    Eq,
+    Ne,
+    Eof,
+}
+
+impl TokenKind {
+    fn tag(&self) -> TokenTag {
+        match self {
+            Self::Ident(_) => TokenTag::Ident,
+            Self::String(_) => TokenTag::String,
+            Self::Bool(_) => TokenTag::Bool,
+            Self::LParen => TokenTag::LParen,
+            Self::RParen => TokenTag::RParen,
+            Self::Comma => TokenTag::Comma,
+            Self::And => TokenTag::And,
+            Self::Or => TokenTag::Or,
+            Self::Eq => TokenTag::Eq,
+            Self::Ne => TokenTag::Ne,
+            Self::Eof => TokenTag::Eof,
+        }
+    }
+}
+
 struct Lexer<'a> {
     input: &'a str,
-    chars: Vec<char>,
-    pos: usize,
+    chars: Peekable<CharIndices<'a>>,
 }
 
 impl<'a> Lexer<'a> {
     fn new(input: &'a str) -> Self {
         Self {
             input,
-            chars: input.chars().collect(),
-            pos: 0,
+            chars: input.char_indices().peekable(),
         }
     }
 
@@ -264,37 +296,41 @@ impl<'a> Lexer<'a> {
         let mut tokens = Vec::new();
         loop {
             self.skip_whitespace();
-            let Some(ch) = self.peek() else {
+            let Some(ch) = self.peek_char() else {
                 break;
             };
 
             let token = match ch {
                 '(' => {
-                    self.pos += 1;
+                    self.next_char();
                     TokenKind::LParen
                 }
                 ')' => {
-                    self.pos += 1;
+                    self.next_char();
                     TokenKind::RParen
                 }
                 ',' => {
-                    self.pos += 1;
+                    self.next_char();
                     TokenKind::Comma
                 }
-                '&' if self.peek_next() == Some('&') => {
-                    self.pos += 2;
+                '&' if self.peek_next_char() == Some('&') => {
+                    self.next_char();
+                    self.next_char();
                     TokenKind::And
                 }
-                '|' if self.peek_next() == Some('|') => {
-                    self.pos += 2;
+                '|' if self.peek_next_char() == Some('|') => {
+                    self.next_char();
+                    self.next_char();
                     TokenKind::Or
                 }
-                '=' if self.peek_next() == Some('=') => {
-                    self.pos += 2;
+                '=' if self.peek_next_char() == Some('=') => {
+                    self.next_char();
+                    self.next_char();
                     TokenKind::Eq
                 }
-                '!' if self.peek_next() == Some('=') => {
-                    self.pos += 2;
+                '!' if self.peek_next_char() == Some('=') => {
+                    self.next_char();
+                    self.next_char();
                     TokenKind::Ne
                 }
                 '"' => TokenKind::String(self.string_literal()?),
@@ -315,24 +351,24 @@ impl<'a> Lexer<'a> {
     }
 
     fn skip_whitespace(&mut self) {
-        while matches!(self.peek(), Some(ch) if ch.is_whitespace()) {
-            self.pos += 1;
+        while matches!(self.peek_char(), Some(ch) if ch.is_whitespace()) {
+            self.next_char();
         }
     }
 
     fn string_literal(&mut self) -> Result<String, ExprError> {
-        self.pos += 1;
+        self.next_char();
         let mut value = String::new();
 
-        while let Some(ch) = self.peek() {
-            self.pos += 1;
+        while let Some(ch) = self.peek_char() {
+            self.next_char();
             match ch {
                 '"' => return Ok(value),
                 '\\' => {
-                    let escaped = self.peek().ok_or_else(|| {
+                    let escaped = self.peek_char().ok_or_else(|| {
                         ExprError::Parse("unterminated escape sequence in string".to_string())
                     })?;
-                    self.pos += 1;
+                    self.next_char();
                     value.push(match escaped {
                         'n' => '\n',
                         'r' => '\r',
@@ -354,12 +390,12 @@ impl<'a> Lexer<'a> {
     }
 
     fn identifier(&mut self) -> TokenKind {
-        let start = self.pos;
-        self.pos += 1;
-        while matches!(self.peek(), Some(ch) if is_ident_continue(ch)) {
-            self.pos += 1;
+        let start = self.byte_pos();
+        self.next_char();
+        while matches!(self.peek_char(), Some(ch) if is_ident_continue(ch)) {
+            self.next_char();
         }
-        let ident: String = self.chars[start..self.pos].iter().collect();
+        let ident = self.input[start..self.byte_pos()].to_string();
         match ident.as_str() {
             "true" => TokenKind::Bool(true),
             "false" => TokenKind::Bool(false),
@@ -367,16 +403,24 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+    fn peek_char(&mut self) -> Option<char> {
+        self.chars.peek().map(|(_, ch)| *ch)
     }
 
-    fn peek_next(&self) -> Option<char> {
-        self.chars.get(self.pos + 1).copied()
+    fn peek_next_char(&self) -> Option<char> {
+        // The cloned iterator still includes the currently peeked char, so nth(1) is next.
+        self.chars.clone().nth(1).map(|(_, ch)| ch)
     }
 
-    fn byte_pos(&self) -> usize {
-        self.chars[..self.pos].iter().map(|ch| ch.len_utf8()).sum()
+    fn next_char(&mut self) -> Option<(usize, char)> {
+        self.chars.next()
+    }
+
+    fn byte_pos(&mut self) -> usize {
+        self.chars
+            .peek()
+            .map(|(byte_pos, _)| *byte_pos)
+            .unwrap_or(self.input.len())
     }
 }
 
@@ -396,7 +440,7 @@ struct Parser {
 impl Parser {
     fn parse_or(&mut self) -> Result<Expr, ExprError> {
         let mut expr = self.parse_and()?;
-        while self.consume(TokenKind::Or) {
+        while self.consume(TokenTag::Or) {
             expr = Expr::Binary {
                 op: BinaryOp::Or,
                 left: Box::new(expr),
@@ -408,7 +452,7 @@ impl Parser {
 
     fn parse_and(&mut self) -> Result<Expr, ExprError> {
         let mut expr = self.parse_equality()?;
-        while self.consume(TokenKind::And) {
+        while self.consume(TokenTag::And) {
             expr = Expr::Binary {
                 op: BinaryOp::And,
                 left: Box::new(expr),
@@ -421,9 +465,9 @@ impl Parser {
     fn parse_equality(&mut self) -> Result<Expr, ExprError> {
         let mut expr = self.parse_primary()?;
         loop {
-            let op = if self.consume(TokenKind::Eq) {
+            let op = if self.consume(TokenTag::Eq) {
                 BinaryOp::Eq
-            } else if self.consume(TokenKind::Ne) {
+            } else if self.consume(TokenTag::Ne) {
                 BinaryOp::Ne
             } else {
                 break;
@@ -441,15 +485,15 @@ impl Parser {
         match self.advance() {
             TokenKind::String(value) => Ok(Expr::Literal(Value::String(value))),
             TokenKind::Bool(value) => Ok(Expr::Literal(Value::Bool(value))),
-            TokenKind::Ident(name) if self.consume(TokenKind::LParen) => {
+            TokenKind::Ident(name) if self.consume(TokenTag::LParen) => {
                 let mut args = Vec::new();
-                if !self.consume(TokenKind::RParen) {
+                if !self.consume(TokenTag::RParen) {
                     loop {
                         args.push(self.parse_or()?);
-                        if self.consume(TokenKind::RParen) {
+                        if self.consume(TokenTag::RParen) {
                             break;
                         }
-                        self.expect(TokenKind::Comma)?;
+                        self.expect(TokenTag::Comma)?;
                     }
                 }
                 Ok(Expr::Call { name, args })
@@ -457,7 +501,7 @@ impl Parser {
             TokenKind::Ident(name) => Ok(Expr::Identifier(name)),
             TokenKind::LParen => {
                 let expr = self.parse_or()?;
-                self.expect(TokenKind::RParen)?;
+                self.expect(TokenTag::RParen)?;
                 Ok(expr)
             }
             other => Err(ExprError::Parse(format!(
@@ -467,8 +511,8 @@ impl Parser {
         }
     }
 
-    fn consume(&mut self, expected: TokenKind) -> bool {
-        if same_variant(self.peek(), &expected) {
+    fn consume(&mut self, expected: TokenTag) -> bool {
+        if self.peek().tag() == expected {
             self.pos += 1;
             true
         } else {
@@ -476,13 +520,13 @@ impl Parser {
         }
     }
 
-    fn expect(&mut self, expected: TokenKind) -> Result<(), ExprError> {
-        if self.consume(expected.clone()) {
+    fn expect(&mut self, expected: TokenTag) -> Result<(), ExprError> {
+        if self.consume(expected) {
             Ok(())
         } else {
             Err(ExprError::Parse(format!(
                 "expected {}, got {}",
-                token_name(&expected),
+                token_tag_name(expected),
                 token_name(self.peek())
             )))
         }
@@ -499,23 +543,23 @@ impl Parser {
     }
 }
 
-fn same_variant(left: &TokenKind, right: &TokenKind) -> bool {
-    std::mem::discriminant(left) == std::mem::discriminant(right)
+fn token_name(token: &TokenKind) -> &'static str {
+    token_tag_name(token.tag())
 }
 
-fn token_name(token: &TokenKind) -> &'static str {
+fn token_tag_name(token: TokenTag) -> &'static str {
     match token {
-        TokenKind::Ident(_) => "identifier",
-        TokenKind::String(_) => "string",
-        TokenKind::Bool(_) => "bool",
-        TokenKind::LParen => "(",
-        TokenKind::RParen => ")",
-        TokenKind::Comma => ",",
-        TokenKind::And => "&&",
-        TokenKind::Or => "||",
-        TokenKind::Eq => "==",
-        TokenKind::Ne => "!=",
-        TokenKind::Eof => "end of input",
+        TokenTag::Ident => "identifier",
+        TokenTag::String => "string",
+        TokenTag::Bool => "bool",
+        TokenTag::LParen => "(",
+        TokenTag::RParen => ")",
+        TokenTag::Comma => ",",
+        TokenTag::And => "&&",
+        TokenTag::Or => "||",
+        TokenTag::Eq => "==",
+        TokenTag::Ne => "!=",
+        TokenTag::Eof => "end of input",
     }
 }
 
@@ -615,6 +659,16 @@ mod tests {
         let error = eval_bool("starts_with(pdf.text, \"t\")", &facts).unwrap_err();
 
         assert_eq!(error, ExprError::UnknownFunction("starts_with".to_string()));
+    }
+
+    #[test]
+    fn parse_errors_report_utf8_byte_offsets() {
+        let error = eval_bool("\u{2003}@", &IndexMap::new()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ExprError::Parse(message) if message.contains("at byte 3")
+        ));
     }
 
     #[test]
