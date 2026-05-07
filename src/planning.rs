@@ -105,7 +105,7 @@ fn build_plan(
     let template_values = template_values(string_facts, &extracted);
     let mut planned_actions = Vec::new();
 
-    for action in &rule.actions {
+    if let Some(action) = rule.actions.first() {
         match action {
             Action::Move(action) => {
                 let to = render::render_destination_path(&action.to, &template_values)?;
@@ -122,7 +122,6 @@ fn build_plan(
                         .unwrap_or(ConflictPolicy::AppendCounter),
                     terminal: true,
                 });
-                break;
             }
             other => return Err(PlanError::UnsupportedAction(other.kind_name())),
         }
