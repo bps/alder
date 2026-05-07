@@ -25,7 +25,7 @@ Alder can currently:
 - execute OS-specific trash actions using the user's Trash/Recycle Bin;
 - handle conflicts including `append_counter` and `replace_if_same_hash`;
 - append action-log records;
-- conservatively undo the last move;
+- conservatively undo the last move, and restore exactly identified trash actions by action ID where the platform exposes Trash/Recycle Bin inventory APIs;
 - generate and sync Watchman triggers that invoke Alder directly;
 - run e2e CLI tests for the main workflow.
 

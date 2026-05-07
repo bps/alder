@@ -128,7 +128,7 @@ Important fields:
 
 ## `undo --json`
 
-`undo` returns an undo report.
+`undo` returns an undo report. Move undo reports include `restored_from`; trash restore reports set `restored_from` to `null` because the Trash/Recycle Bin location is owned by the operating system.
 
 ```json
 {
@@ -186,10 +186,15 @@ Undo writes:
 1. `action = "undo_move", status = "in_progress"`
 2. `action = "undo_move", status = "undone"`
 
+Trash restore by action ID writes:
+
+1. `action = "undo_trash", status = "in_progress"`
+2. `action = "undo_trash", status = "undone"`
+
 Hash dedupe writes:
 
 - `action = "move", status = "deduped"`
 
 Each action log record includes a per-action `action_id` for pairing and reconciliation.
 
-Trash action-log records use `to: null` because the final Trash/Recycle Bin location is owned by the operating system. Restore trash actions from the OS Trash/Recycle Bin; `alder undo` refuses when the latest action is `trash` rather than guessing or reaching past it.
+Trash action-log records use `to: null` because the final Trash/Recycle Bin location is owned by the operating system. New Linux/Freedesktop and Windows trash records may include `trash_time_deleted` when Alder identifies exactly one matching item after trashing. `alder undo <action_id>` accepts an action ID UUID and uses that metadata with the original path and size to restore only exact, collision-free matches. `alder undo` refuses when the latest action is `trash` rather than guessing or reaching past it.

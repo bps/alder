@@ -7,7 +7,7 @@ use clap::CommandFactory;
 use clap::{Args, Parser, Subcommand};
 
 use alder::config::{Action, Config, parse_config_str};
-use alder::execute::undo_last_move;
+use alder::execute::{undo_last_move, undo_trash_by_action_id};
 use alder::pipeline::{
     ProcessOptions, destination_roots, explain_file, facts_for_file, process_paths,
 };
@@ -281,19 +281,30 @@ fn run_explain(
 }
 
 fn run_undo(json: bool, args: UndoArgs) -> Result<ExitCode, String> {
-    if !matches!(args.target.as_deref(), None | Some("last")) {
-        return Err("only `alder undo` and `alder undo last` are supported for now".to_string());
-    }
-
-    let report = undo_last_move(&default_action_log_path()).map_err(|error| error.to_string())?;
+    let report = match args.target.as_deref() {
+        None | Some("last") => {
+            undo_last_move(&default_action_log_path()).map_err(|error| error.to_string())?
+        }
+        Some(action_id) => {
+            uuid::Uuid::parse_str(action_id).map_err(|_| {
+                "undo target must be `last` or an action_id UUID for a trash action".to_string()
+            })?;
+            undo_trash_by_action_id(&default_action_log_path(), action_id)
+                .map_err(|error| error.to_string())?
+        }
+    };
     if json {
         print_json(&report)
     } else {
-        println!(
-            "Undid move: {} -> {}",
-            report.restored_from.display(),
-            report.restored_to.display()
-        );
+        if let Some(restored_from) = &report.restored_from {
+            println!(
+                "Undid move: {} -> {}",
+                restored_from.display(),
+                report.restored_to.display()
+            );
+        } else {
+            println!("Restored trash action to {}", report.restored_to.display());
+        }
         Ok(ExitCode::SUCCESS)
     }
 }

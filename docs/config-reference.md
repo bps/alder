@@ -249,8 +249,10 @@ Safety behavior:
 - dry-runs produce a planned `trash` execution record and do not mutate the filesystem or action log;
 - non-dry-run trash validates that the source is a regular non-symlink file;
 - trash actions append explicit action-log records with source sizes for audit;
+- on Linux/Freedesktop and Windows, new trash records also include restore metadata when Alder can identify exactly one matching Trash/Recycle Bin item immediately after the trash operation;
 - `defaults.destination_roots` is not required because there is no Alder destination path to validate;
-- `alder undo` does not automatically restore trash actions. Restore from the operating system Trash/Recycle Bin. If the latest action is `trash`, `alder undo` refuses rather than reaching past it to undo an older move.
+- `alder undo` and `alder undo last` do not automatically restore trash actions. If the latest action is `trash`, they refuse rather than reaching past it to undo an older move;
+- `alder undo <action_id>` accepts an action ID UUID and can restore a trash action only when the source path is absent and the current Trash/Recycle Bin has exactly one item matching the logged original path, deletion time, and size. macOS currently refuses automatic trash restore because the required inventory/restore APIs are unavailable.
 
 `move` and `trash` are executed by the current CLI pipeline.
 

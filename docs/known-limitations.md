@@ -22,7 +22,11 @@ Non-dry-run moves require `defaults.destination_roots`. This is deliberate. Alde
 
 ### Trash undo
 
-`trash` actions use the operating system Trash/Recycle Bin and are intended to be restored there. Alder logs trash actions for audit, but `alder undo` does not automatically restore them. If the latest action is `trash`, undo refuses rather than guessing or reaching past it to undo an older move.
+`trash` actions use the operating system Trash/Recycle Bin and are intended to be restored there. `alder undo` and `alder undo last` still do not automatically restore the latest trash action; they refuse rather than guessing or reaching past it to undo an older move.
+
+On Linux/Freedesktop and Windows, new trash records include conservative restore metadata when Alder can identify exactly one matching Trash/Recycle Bin item immediately after the trash operation. `alder undo <action_id>` can restore such a trash action only when the source path is still absent and the current Trash/Recycle Bin contains exactly one item matching the original path, deletion time, and size. Missing metadata, duplicate matches, missing matches, or source-path collisions all refuse automatic restore.
+
+macOS does not expose the `trash::os_limited` inventory/restore APIs that Alder uses for conservative restore. On macOS, restore trash actions from Finder/Trash Put Back; `alder undo <action_id>` refuses automatic trash restore.
 
 Trash behavior depends on the host OS and user environment. Headless/minimal Linux environments need a writable FreeDesktop-style trash location; removable, network, or unusual filesystems may fail or have platform-specific Recycle Bin behavior; and macOS protected locations may require appropriate user permissions. Alder reports the platform trash error and leaves the source in place when the trash operation fails.
 
@@ -46,9 +50,9 @@ Alder avoids expensive providers unless their domains are referenced, but it is 
 
 `stabilize.unchanged_for` and `stabilize.timeout` are present in the schema, but the current CLI pipeline does not yet wait for file stability before processing.
 
-### Undo supports the last move only
+### Undo selectors are limited
 
-`alder undo` and `alder undo last` are implemented. Undo by action ID, file path, run ID, or time range is not yet implemented.
+`alder undo` and `alder undo last` undo the latest move only. `alder undo <action_id>` accepts action ID UUIDs and is implemented for conservatively identified trash actions on platforms with Trash/Recycle Bin inventory APIs. Undo by file path, run ID, or time range is not yet implemented.
 
 ### Reconciliation is an API, not a CLI command
 

@@ -47,6 +47,7 @@ pub enum ActionKind {
     Move,
     Trash,
     UndoMove,
+    UndoTrash,
 }
 
 impl ActionKind {
@@ -55,6 +56,7 @@ impl ActionKind {
             Self::Move => "move",
             Self::Trash => "trash",
             Self::UndoMove => "undo_move",
+            Self::UndoTrash => "undo_trash",
         }
     }
 }
@@ -94,6 +96,8 @@ struct ActionLogRecord {
     to: Option<PathBuf>,
     sha256: Option<String>,
     size: Option<u64>,
+    #[serde(default)]
+    trash_time_deleted: Option<i64>,
     reason: Option<String>,
 }
 
@@ -108,6 +112,7 @@ struct ActionLogRecordInput<'a> {
     to: Option<&'a Path>,
     sha256: Option<String>,
     size: Option<u64>,
+    trash_time_deleted: Option<i64>,
     reason: Option<String>,
 }
 
@@ -244,6 +249,7 @@ fn execute_move(
         to: Some(&destination),
         sha256: Some(sha256.clone()),
         size: Some(size),
+        trash_time_deleted: None,
         reason: None,
     });
     log.append(&intent)?;
@@ -267,6 +273,7 @@ fn execute_move(
         to: Some(&destination),
         sha256: Some(sha256.clone()),
         size: Some(size),
+        trash_time_deleted: None,
         reason: None,
     });
     log.append(&committed)?;
@@ -289,7 +296,11 @@ fn execute_trash(
     log: &mut ActionLog,
 ) -> Result<ExecutionRecord, ExecuteError> {
     reject_unsafe_source(&plan.source)?;
-    let source_facts = FileFacts::from_path(&plan.source)?;
+    let source = plan
+        .source
+        .canonicalize()
+        .map_err(|error| ExecuteError::io("canonicalize trash source", &plan.source, error))?;
+    let source_facts = FileFacts::from_path(&source)?;
     let source = source_facts.path().to_path_buf();
     let size = source_facts.size();
     let action_id = new_action_id();
@@ -305,10 +316,12 @@ fn execute_trash(
         to: None,
         sha256: None,
         size: Some(size),
+        trash_time_deleted: None,
         reason: reason.clone(),
     });
     log.append(&intent)?;
 
+    let captured_before_delete = unix_seconds();
     if let Err(error) = trash::delete(&source) {
         let failed = ActionLogRecord::new(ActionLogRecordInput {
             action_id,
@@ -321,11 +334,17 @@ fn execute_trash(
             to: None,
             sha256: None,
             size: Some(size),
+            trash_time_deleted: None,
             reason: Some(format!("trash operation failed: {error}")),
         });
         log.append(&failed)?;
         return Err(ExecuteError::Trash(error));
     }
+    let captured_after_delete = unix_seconds();
+    let trash_time_deleted =
+        identify_trashed_file(&source, size, captured_before_delete, captured_after_delete)
+            .ok()
+            .flatten();
 
     let committed = ActionLogRecord::new(ActionLogRecordInput {
         action_id,
@@ -338,6 +357,7 @@ fn execute_trash(
         to: None,
         sha256: None,
         size: Some(size),
+        trash_time_deleted,
         reason: reason.clone(),
     });
     log.append(&committed)?;
@@ -400,6 +420,7 @@ fn dedupe_if_same_hash(
         to: Some(destination),
         sha256: Some(source_hash.clone()),
         size: Some(source_facts.size()),
+        trash_time_deleted: None,
         reason: Some("destination already has same hash; removed source duplicate".to_string()),
     });
     log.append(&record)?;
@@ -602,7 +623,7 @@ impl Drop for ActionLog {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UndoReport {
     pub undone_action_id: String,
-    pub restored_from: PathBuf,
+    pub restored_from: Option<PathBuf>,
     pub restored_to: PathBuf,
     pub status: ExecutionStatus,
 }
@@ -674,6 +695,7 @@ pub fn undo_last_move(action_log_path: &Path) -> Result<UndoReport, ExecuteError
         to: Some(&record.from),
         sha256: record.sha256.clone(),
         size: record.size,
+        trash_time_deleted: None,
         reason: Some("undo move".to_string()),
     });
     log.append(&intent)?;
@@ -691,24 +713,140 @@ pub fn undo_last_move(action_log_path: &Path) -> Result<UndoReport, ExecuteError
         to: Some(&record.from),
         sha256: record.sha256.clone(),
         size: record.size,
+        trash_time_deleted: None,
         reason: Some("undo move".to_string()),
     });
     log.append(&undone)?;
 
     Ok(UndoReport {
         undone_action_id: record.action_id,
-        restored_from: destination.to_path_buf(),
+        restored_from: Some(destination.to_path_buf()),
         restored_to: record.from,
         status: ExecutionStatus::Undone,
     })
 }
 
+pub fn undo_trash_by_action_id(
+    action_log_path: &Path,
+    action_id: &str,
+) -> Result<UndoReport, ExecuteError> {
+    let mut log = ActionLog::open(action_log_path)?;
+    let records = log.read_records()?;
+    let record = completed_trash_record_by_action_id(&records, action_id)?;
+
+    if records.iter().any(|candidate| {
+        candidate.status == ExecutionStatus::Undone
+            && candidate.undoes_action_id.as_deref() == Some(record.action_id.as_str())
+    }) {
+        return Err(ExecuteError::UndoRefused(format!(
+            "trash action {} has already been undone",
+            record.action_id
+        )));
+    }
+    if record.from.exists() {
+        return Err(ExecuteError::UndoRefused(format!(
+            "source path already exists: {}",
+            record.from.display()
+        )));
+    }
+    if record.size.is_none() || record.trash_time_deleted.is_none() {
+        return Err(ExecuteError::UndoRefused(
+            "trash record lacks restore metadata; the action may predate trash restore support or could not be identified at trash time"
+                .to_string(),
+        ));
+    }
+
+    let undo_action_id = new_action_id();
+    let intent = ActionLogRecord::new(ActionLogRecordInput {
+        action_id: undo_action_id.clone(),
+        undoes_action_id: Some(record.action_id.clone()),
+        run_id: &record.run_id,
+        rule_id: &record.rule_id,
+        action: ActionKind::UndoTrash,
+        status: ExecutionStatus::InProgress,
+        from: &record.from,
+        to: Some(&record.from),
+        sha256: record.sha256.clone(),
+        size: record.size,
+        trash_time_deleted: record.trash_time_deleted,
+        reason: Some("undo trash".to_string()),
+    });
+    log.append(&intent)?;
+
+    if let Err(error) = restore_trash_record(&record) {
+        let reason = error.to_string();
+        let failed = ActionLogRecord::new(ActionLogRecordInput {
+            action_id: undo_action_id,
+            undoes_action_id: Some(record.action_id.clone()),
+            run_id: &record.run_id,
+            rule_id: &record.rule_id,
+            action: ActionKind::UndoTrash,
+            status: ExecutionStatus::Failed,
+            from: &record.from,
+            to: Some(&record.from),
+            sha256: record.sha256.clone(),
+            size: record.size,
+            trash_time_deleted: record.trash_time_deleted,
+            reason: Some(reason),
+        });
+        log.append(&failed)?;
+        return Err(error);
+    }
+
+    let undone = ActionLogRecord::new(ActionLogRecordInput {
+        action_id: undo_action_id,
+        undoes_action_id: Some(record.action_id.clone()),
+        run_id: &record.run_id,
+        rule_id: &record.rule_id,
+        action: ActionKind::UndoTrash,
+        status: ExecutionStatus::Undone,
+        from: &record.from,
+        to: Some(&record.from),
+        sha256: record.sha256.clone(),
+        size: record.size,
+        trash_time_deleted: record.trash_time_deleted,
+        reason: Some("undo trash".to_string()),
+    });
+    log.append(&undone)?;
+
+    Ok(UndoReport {
+        undone_action_id: record.action_id,
+        restored_from: None,
+        restored_to: record.from,
+        status: ExecutionStatus::Undone,
+    })
+}
+
+fn completed_trash_record_by_action_id(
+    records: &[ActionLogRecord],
+    action_id: &str,
+) -> Result<ActionLogRecord, ExecuteError> {
+    if let Some(record) = records.iter().rev().find(|record| {
+        record.action_id == action_id
+            && record.action == ActionKind::Trash
+            && record.status == ExecutionStatus::Trashed
+    }) {
+        return Ok(record.clone());
+    }
+
+    if let Some(record) = records
+        .iter()
+        .rev()
+        .find(|record| record.action_id == action_id)
+    {
+        return Err(ExecuteError::UndoRefused(format!(
+            "action {action_id} is {} with status {:?}, not a completed trash action",
+            record.action, record.status
+        )));
+    }
+
+    Err(ExecuteError::NothingToUndo)
+}
+
 fn latest_unundone_terminal_record(records: &[ActionLogRecord]) -> Option<&ActionLogRecord> {
     let undone: std::collections::HashSet<&str> = records
         .iter()
-        .filter(|record| {
-            record.action == ActionKind::UndoMove && record.status == ExecutionStatus::Undone
-        })
+        .filter(|record| record.status == ExecutionStatus::Undone)
         .filter_map(|record| record.undoes_action_id.as_deref())
         .collect();
 
@@ -731,9 +869,7 @@ pub fn reconcile_action_log(action_log_path: &Path) -> Result<Vec<ReconcileFindi
 fn latest_unundone_move(records: &[ActionLogRecord]) -> Option<ActionLogRecord> {
     let undone: std::collections::HashSet<&str> = records
         .iter()
-        .filter(|record| {
-            record.action == ActionKind::UndoMove && record.status == ExecutionStatus::Undone
-        })
+        .filter(|record| record.status == ExecutionStatus::Undone)
         .filter_map(|record| record.undoes_action_id.as_deref())
         .collect();
 
@@ -775,6 +911,71 @@ fn reconcile_records(records: &[ActionLogRecord]) -> Vec<ReconcileFinding> {
         .collect()
 }
 
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+fn restore_trash_record(record: &ActionLogRecord) -> Result<(), ExecuteError> {
+    let expected_size = record.size.ok_or_else(|| {
+        ExecuteError::UndoRefused("trash record lacks size; refusing automatic restore".to_string())
+    })?;
+    let expected_time = record.trash_time_deleted.ok_or_else(|| {
+        ExecuteError::UndoRefused(
+            "trash record lacks deletion time; refusing automatic restore".to_string(),
+        )
+    })?;
+
+    let mut matches = Vec::new();
+    for item in trash::os_limited::list().map_err(ExecuteError::TrashRestore)? {
+        if item.original_path() != record.from || item.time_deleted != expected_time {
+            continue;
+        }
+        let metadata = trash::os_limited::metadata(&item).map_err(ExecuteError::TrashRestore)?;
+        if metadata.size.size() == Some(expected_size) {
+            matches.push(item);
+        }
+    }
+
+    match matches.len() {
+        0 => Err(ExecuteError::UndoRefused(format!(
+            "could not identify an exact trash item for action {}",
+            record.action_id
+        ))),
+        1 => trash::os_limited::restore_all(matches).map_err(|error| match error {
+            trash::Error::RestoreCollision { path, .. } => ExecuteError::UndoRefused(format!(
+                "source path collision while restoring trash item: {}",
+                path.display()
+            )),
+            other => ExecuteError::TrashRestore(other),
+        }),
+        _ => Err(ExecuteError::UndoRefused(format!(
+            "multiple trash items match action {}; refusing automatic restore",
+            record.action_id
+        ))),
+    }
+}
+
+#[cfg(not(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+)))]
+fn restore_trash_record(_record: &ActionLogRecord) -> Result<(), ExecuteError> {
+    Err(ExecuteError::UndoRefused(
+        "automatic trash restore is not supported on this platform; restore from the operating system Trash/Recycle Bin"
+            .to_string(),
+    ))
+}
+
 impl ActionLogRecord {
     fn new(input: ActionLogRecordInput<'_>) -> Self {
         let ActionLogRecordInput {
@@ -788,6 +989,7 @@ impl ActionLogRecord {
             to,
             sha256,
             size,
+            trash_time_deleted,
             reason,
         } = input;
 
@@ -807,6 +1009,7 @@ impl ActionLogRecord {
             to: to.map(Path::to_path_buf),
             sha256,
             size,
+            trash_time_deleted,
             reason,
         }
     }
@@ -814,6 +1017,72 @@ impl ActionLogRecord {
 
 fn new_action_id() -> String {
     Uuid::new_v4().to_string()
+}
+
+fn unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+fn identify_trashed_file(
+    original_path: &Path,
+    size: u64,
+    captured_before_delete: i64,
+    captured_after_delete: i64,
+) -> Result<Option<i64>, trash::Error> {
+    const TRASH_TIME_TOLERANCE_SECONDS: i64 = 5;
+
+    let mut matches = Vec::new();
+    for item in trash::os_limited::list()? {
+        if item.original_path() != original_path {
+            continue;
+        }
+        if item.time_deleted < captured_before_delete.saturating_sub(TRASH_TIME_TOLERANCE_SECONDS)
+            || item.time_deleted
+                > captured_after_delete.saturating_add(TRASH_TIME_TOLERANCE_SECONDS)
+        {
+            continue;
+        }
+        let metadata = trash::os_limited::metadata(&item)?;
+        if metadata.size.size() == Some(size) {
+            matches.push(item.time_deleted);
+        }
+    }
+
+    Ok(if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    })
+}
+
+#[cfg(not(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+)))]
+fn identify_trashed_file(
+    _original_path: &Path,
+    _size: u64,
+    _captured_before_delete: i64,
+    _captured_after_delete: i64,
+) -> Result<Option<i64>, trash::Error> {
+    Ok(None)
 }
 
 #[derive(Debug, Error)]
@@ -854,6 +1123,8 @@ pub enum ExecuteError {
     UndoRefused(String),
     #[error("failed to move source to operating system trash/recycle bin: {0}")]
     Trash(#[from] trash::Error),
+    #[error("failed to restore source from operating system trash/recycle bin: {0}")]
+    TrashRestore(#[source] trash::Error),
     #[error(transparent)]
     FileFact(#[from] FileFactError),
     #[error("failed to {op} for {}: {source}", path.display())]
@@ -893,6 +1164,10 @@ mod tests {
             r#""undo_move""#
         );
         assert_eq!(
+            serde_json::to_string(&ActionKind::UndoTrash).unwrap(),
+            r#""undo_trash""#
+        );
+        assert_eq!(
             serde_json::to_string(&ActionKind::Trash).unwrap(),
             r#""trash""#
         );
@@ -903,6 +1178,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ActionKind>(r#""undo_move""#).unwrap(),
             ActionKind::UndoMove
+        );
+        assert_eq!(
+            serde_json::from_str::<ActionKind>(r#""undo_trash""#).unwrap(),
+            ActionKind::UndoTrash
         );
         assert_eq!(
             serde_json::from_str::<ActionKind>(r#""trash""#).unwrap(),
@@ -1209,6 +1488,7 @@ mod tests {
                     to: Some(Path::new("/to")),
                     sha256: Some("abc".to_string()),
                     size: Some(3),
+                    trash_time_deleted: None,
                     reason: None,
                 }))
                 .unwrap();
@@ -1224,6 +1504,7 @@ mod tests {
                     to: None,
                     sha256: None,
                     size: Some(4),
+                    trash_time_deleted: None,
                     reason: Some("move to operating system trash/recycle bin".to_string()),
                 }))
                 .unwrap();
@@ -1233,6 +1514,120 @@ mod tests {
 
         assert!(
             matches!(error, ExecuteError::UndoRefused(message) if message.contains("Trash/Recycle Bin"))
+        );
+    }
+
+    #[test]
+    fn undo_last_move_ignores_already_undone_trash_action() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.pdf");
+        let dest_root = temp_dir.path().join("dest");
+        fs::create_dir(&dest_root).unwrap();
+        let dest = dest_root.join("source.pdf");
+        fs::write(&source, b"abc").unwrap();
+        let log = temp_dir.path().join("actions.jsonl");
+        let plan = plan(&source, &dest, ConflictPolicy::Error);
+        execute_plan(&plan, &options(false, &dest_root, &log)).unwrap();
+        {
+            let mut action_log = ActionLog::open(&log).unwrap();
+            action_log
+                .append(&ActionLogRecord::new(ActionLogRecordInput {
+                    action_id: "trash-1".to_string(),
+                    undoes_action_id: None,
+                    run_id: "run",
+                    rule_id: "rule",
+                    action: ActionKind::Trash,
+                    status: ExecutionStatus::Trashed,
+                    from: Path::new("/trashed"),
+                    to: None,
+                    sha256: None,
+                    size: Some(4),
+                    trash_time_deleted: Some(1),
+                    reason: Some("move to operating system trash/recycle bin".to_string()),
+                }))
+                .unwrap();
+            action_log
+                .append(&ActionLogRecord::new(ActionLogRecordInput {
+                    action_id: "undo-trash-1".to_string(),
+                    undoes_action_id: Some("trash-1".to_string()),
+                    run_id: "run",
+                    rule_id: "rule",
+                    action: ActionKind::UndoTrash,
+                    status: ExecutionStatus::Undone,
+                    from: Path::new("/trashed"),
+                    to: Some(Path::new("/trashed")),
+                    sha256: None,
+                    size: Some(4),
+                    trash_time_deleted: Some(1),
+                    reason: Some("undo trash".to_string()),
+                }))
+                .unwrap();
+        }
+
+        let report = undo_last_move(&log).unwrap();
+
+        assert_eq!(report.status, ExecutionStatus::Undone);
+        assert!(source.exists());
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn undo_trash_by_action_id_refuses_non_trash_action() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let log = temp_dir.path().join("actions.jsonl");
+        {
+            let mut action_log = ActionLog::open(&log).unwrap();
+            action_log
+                .append(&ActionLogRecord::new(ActionLogRecordInput {
+                    action_id: "move-1".to_string(),
+                    undoes_action_id: None,
+                    run_id: "run",
+                    rule_id: "rule",
+                    action: ActionKind::Move,
+                    status: ExecutionStatus::Moved,
+                    from: Path::new("/from"),
+                    to: Some(Path::new("/to")),
+                    sha256: Some("abc".to_string()),
+                    size: Some(3),
+                    trash_time_deleted: None,
+                    reason: None,
+                }))
+                .unwrap();
+        }
+
+        let error = undo_trash_by_action_id(&log, "move-1").unwrap_err();
+
+        assert!(
+            matches!(error, ExecuteError::UndoRefused(message) if message.contains("not a completed trash action"))
+        );
+    }
+
+    #[test]
+    fn undo_trash_by_action_id_refuses_source_collision() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.pdf");
+        fs::write(&source, b"replacement").unwrap();
+        let log = temp_dir.path().join("actions.jsonl");
+        append_trashed_record(&log, "trash-1", &source, Some(1));
+
+        let error = undo_trash_by_action_id(&log, "trash-1").unwrap_err();
+
+        assert!(
+            matches!(error, ExecuteError::UndoRefused(message) if message.contains("source path already exists"))
+        );
+    }
+
+    #[test]
+    fn undo_trash_by_action_id_refuses_records_without_restore_metadata() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.pdf");
+        let log = temp_dir.path().join("actions.jsonl");
+        append_trashed_record(&log, "trash-1", &source, None);
+
+        let error = undo_trash_by_action_id(&log, "trash-1").unwrap_err();
+
+        assert!(
+            matches!(error, ExecuteError::UndoRefused(message) if message.contains("restore metadata"))
         );
     }
 
@@ -1251,6 +1646,7 @@ mod tests {
             to: Some(Path::new("/to")),
             sha256: None,
             size: None,
+            trash_time_deleted: None,
             reason: None,
         });
         {
@@ -1302,6 +1698,31 @@ mod tests {
         assert!(matches!(error, ExecuteError::HashMismatch { .. }));
         assert_eq!(fs::read(&source).unwrap(), b"abc");
         assert_eq!(fs::read(&dest).unwrap(), b"different");
+    }
+
+    fn append_trashed_record(
+        log: &Path,
+        action_id: &str,
+        source: &Path,
+        trash_time_deleted: Option<i64>,
+    ) {
+        let mut action_log = ActionLog::open(log).unwrap();
+        action_log
+            .append(&ActionLogRecord::new(ActionLogRecordInput {
+                action_id: action_id.to_string(),
+                undoes_action_id: None,
+                run_id: "run",
+                rule_id: "rule",
+                action: ActionKind::Trash,
+                status: ExecutionStatus::Trashed,
+                from: source,
+                to: None,
+                sha256: None,
+                size: Some(3),
+                trash_time_deleted,
+                reason: Some("move to operating system trash/recycle bin".to_string()),
+            }))
+            .unwrap();
     }
 
     fn plan(source: &Path, destination: &Path, conflict: ConflictPolicy) -> ActionPlan {
