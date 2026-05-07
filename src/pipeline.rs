@@ -85,23 +85,18 @@ pub fn process_paths(
 pub fn explain_file(config: &Config, path: impl AsRef<Path>) -> PipelineResult {
     let source = path.as_ref().to_path_buf();
     let facts_output = facts_for_file(config, &source);
-    match plan_for_file(config, &source, &facts_output.facts) {
-        Ok(explanation) => PipelineResult {
-            source,
-            provider_errors: facts_output.provider_errors,
-            provider_reports: facts_output.provider_reports,
-            explanation: Some(explanation),
-            execution: None,
-            error: None,
-        },
-        Err(error) => PipelineResult {
-            source,
-            provider_errors: facts_output.provider_errors,
-            provider_reports: facts_output.provider_reports,
-            explanation: None,
-            execution: None,
-            error: Some(error.to_string()),
-        },
+    let (explanation, error) = match plan_for_file(config, &source, &facts_output.facts) {
+        Ok(explanation) => (Some(explanation), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+
+    PipelineResult {
+        source,
+        provider_errors: facts_output.provider_errors,
+        provider_reports: facts_output.provider_reports,
+        explanation,
+        execution: None,
+        error,
     }
 }
 
@@ -270,21 +265,19 @@ pub fn destination_roots(config: &Config) -> Result<Vec<PathBuf>, String> {
 
 fn process_file(config: &Config, source: PathBuf, options: &ProcessOptions) -> PipelineResult {
     let facts_output = facts_for_file(config, &source);
+    let mut error = None;
     let explanation = match plan_for_file(config, &source, &facts_output.facts) {
-        Ok(explanation) => explanation,
-        Err(error) => {
-            return PipelineResult {
-                source,
-                provider_errors: facts_output.provider_errors,
-                provider_reports: facts_output.provider_reports,
-                explanation: None,
-                execution: None,
-                error: Some(error.to_string()),
-            };
+        Ok(explanation) => Some(explanation),
+        Err(plan_error) => {
+            error = Some(plan_error.to_string());
+            None
         }
     };
 
-    let execution = if let Some(plan) = explanation.plan.as_ref() {
+    let execution = if let Some(plan) = explanation
+        .as_ref()
+        .and_then(|explanation| explanation.plan.as_ref())
+    {
         let execute_options = ExecuteOptions {
             dry_run: options.dry_run,
             destination_roots: options.destination_roots.clone(),
@@ -293,15 +286,9 @@ fn process_file(config: &Config, source: PathBuf, options: &ProcessOptions) -> P
         };
         match execute_plan(plan, &execute_options) {
             Ok(report) => Some(report),
-            Err(error) => {
-                return PipelineResult {
-                    source,
-                    provider_errors: facts_output.provider_errors,
-                    provider_reports: facts_output.provider_reports,
-                    explanation: Some(explanation),
-                    execution: None,
-                    error: Some(error.to_string()),
-                };
+            Err(execute_error) => {
+                error = Some(execute_error.to_string());
+                None
             }
         }
     } else {
@@ -312,9 +299,9 @@ fn process_file(config: &Config, source: PathBuf, options: &ProcessOptions) -> P
         source,
         provider_errors: facts_output.provider_errors,
         provider_reports: facts_output.provider_reports,
-        explanation: Some(explanation),
+        explanation,
         execution,
-        error: None,
+        error,
     }
 }
 
