@@ -1,4 +1,5 @@
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 
 use chrono::NaiveDate;
 use indexmap::IndexMap;
@@ -62,15 +63,23 @@ fn parse_date_variable(variable: &str, value: &str, format: &str) -> Result<Stri
         })
 }
 
+static TEMPLATE_ENV: OnceLock<Environment<'static>> = OnceLock::new();
+
+fn template_environment() -> &'static Environment<'static> {
+    TEMPLATE_ENV.get_or_init(|| {
+        let mut env = Environment::new();
+        env.set_undefined_behavior(UndefinedBehavior::Strict);
+        env.add_filter("date", date_filter);
+        env
+    })
+}
+
 pub fn render_template(
     template: &str,
     variables: &IndexMap<String, String>,
 ) -> Result<String, RenderError> {
-    let mut env = Environment::new();
-    env.set_undefined_behavior(UndefinedBehavior::Strict);
-    env.add_filter("date", date_filter);
     let context = build_template_context(variables)?;
-    let tmpl = env
+    let tmpl = template_environment()
         .template_from_str(template)
         .map_err(|error| RenderError::Template(error.to_string()))?;
     tmpl.render(context)
