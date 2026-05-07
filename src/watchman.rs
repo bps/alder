@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Serialize, Serializer};
-use serde_json::Value;
+use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::config::{Config, WatchConfig};
@@ -31,7 +31,7 @@ impl WatchmanGenerateOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TriggerCommand {
     command: String,
     root: PathBuf,
@@ -61,72 +61,13 @@ impl Serialize for TriggerCommand {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TriggerDefinition {
     pub name: String,
-    pub expression: WatchmanExpression,
+    pub expression: Value,
     pub command: Vec<String>,
     pub append_files: bool,
     pub stdin: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WatchmanExpression {
-    Type(String),
-    Suffix(String),
-    Match { pattern: String, scope: String },
-    AllOf(Vec<WatchmanExpression>),
-    AnyOf(Vec<WatchmanExpression>),
-    Not(Box<WatchmanExpression>),
-}
-
-impl Serialize for WatchmanExpression {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            Self::Type(value) => vec![
-                Value::String("type".to_string()),
-                Value::String(value.clone()),
-            ]
-            .serialize(serializer),
-            Self::Suffix(value) => vec![
-                Value::String("suffix".to_string()),
-                Value::String(value.clone()),
-            ]
-            .serialize(serializer),
-            Self::Match { pattern, scope } => vec![
-                Value::String("match".to_string()),
-                Value::String(pattern.clone()),
-                Value::String(scope.clone()),
-            ]
-            .serialize(serializer),
-            Self::AllOf(items) => serialize_variadic("allof", items, serializer),
-            Self::AnyOf(items) => serialize_variadic("anyof", items, serializer),
-            Self::Not(item) => vec![
-                Value::String("not".to_string()),
-                serde_json::to_value(item).map_err(serde::ser::Error::custom)?,
-            ]
-            .serialize(serializer),
-        }
-    }
-}
-
-fn serialize_variadic<S>(
-    op: &str,
-    items: &[WatchmanExpression],
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let mut values = Vec::with_capacity(items.len() + 1);
-    values.push(Value::String(op.to_string()));
-    for item in items {
-        values.push(serde_json::to_value(item).map_err(serde::ser::Error::custom)?);
-    }
-    values.serialize(serializer)
 }
 
 pub fn generate_trigger_commands(
@@ -227,19 +168,17 @@ impl WatchPatterns {
         })
     }
 
-    fn expression(&self) -> WatchmanExpression {
-        let mut clauses = vec![WatchmanExpression::Type("f".to_string())];
+    fn expression(&self) -> Value {
+        let mut clauses = vec![json!(["type", "f"])];
 
         if !self.include.is_empty() {
             clauses.push(pattern_expression(&self.include));
         }
         if !self.ignore.is_empty() {
-            clauses.push(WatchmanExpression::Not(Box::new(pattern_expression(
-                &self.ignore,
-            ))));
+            clauses.push(json!(["not", pattern_expression(&self.ignore)]));
         }
 
-        WatchmanExpression::AllOf(clauses)
+        variadic_expression("allof", clauses)
     }
 
     fn is_match(&self, rel: &Path) -> bool {
@@ -253,23 +192,27 @@ impl WatchPatterns {
     }
 }
 
-fn pattern_expression(patterns: &[String]) -> WatchmanExpression {
+fn pattern_expression(patterns: &[String]) -> Value {
     let expressions = patterns
         .iter()
         .map(|pattern| pattern_to_expression(pattern))
         .collect();
-    WatchmanExpression::AnyOf(expressions)
+    variadic_expression("anyof", expressions)
 }
 
-fn pattern_to_expression(pattern: &str) -> WatchmanExpression {
+fn pattern_to_expression(pattern: &str) -> Value {
     if let Some(suffix) = simple_suffix(pattern) {
-        WatchmanExpression::Suffix(suffix)
+        json!(["suffix", suffix])
     } else {
-        WatchmanExpression::Match {
-            pattern: pattern.to_string(),
-            scope: "wholename".to_string(),
-        }
+        json!(["match", pattern, "wholename"])
     }
+}
+
+fn variadic_expression(op: &str, expressions: Vec<Value>) -> Value {
+    let mut values = Vec::with_capacity(expressions.len() + 1);
+    values.push(Value::String(op.to_string()));
+    values.extend(expressions);
+    Value::Array(values)
 }
 
 fn simple_suffix(pattern: &str) -> Option<String> {
@@ -581,8 +524,52 @@ rules:
                 "/tmp/alder.yaml"
             ])
         );
-        assert!(value[2]["expression"].to_string().contains("suffix"));
-        assert!(value[2]["expression"].to_string().contains("download"));
+        assert_eq!(
+            value[2]["expression"],
+            serde_json::json!([
+                "allof",
+                ["type", "f"],
+                ["anyof", ["suffix", "pdf"]],
+                ["not", ["anyof", ["suffix", "download"], ["suffix", "tmp"]]]
+            ])
+        );
+    }
+
+    #[test]
+    fn generated_expression_uses_wholename_match_for_complex_globs() {
+        let config = parse_config_str(
+            r#"
+version: 1
+watch:
+  paths:
+    - tmp/inbox
+  include:
+    - "receipts/*.pdf"
+rules:
+  - id: pdfs
+    when: file.ext == ".pdf"
+    actions:
+      - move:
+          to: "~/Documents/{{ file.name }}"
+"#,
+        )
+        .unwrap();
+        let options = WatchmanGenerateOptions::new(
+            PathBuf::from("/tmp/alder.yaml"),
+            PathBuf::from("/bin/alder"),
+        );
+
+        let commands = generate_trigger_commands(&config, &options).unwrap();
+        let value = serde_json::to_value(&commands[0]).unwrap();
+
+        assert_eq!(
+            value[2]["expression"],
+            serde_json::json!([
+                "allof",
+                ["type", "f"],
+                ["anyof", ["match", "receipts/*.pdf", "wholename"]]
+            ])
+        );
     }
 
     #[test]

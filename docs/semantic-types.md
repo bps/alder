@@ -38,10 +38,9 @@ The Watchman trigger work has a healthy boundary:
 - `WatchmanGenerateOptions`
 - `TriggerCommand`
 - `TriggerDefinition`
-- `WatchmanExpression`
 - `WatchmanError`
 
-Using `WatchmanExpression` instead of constructing arbitrary JSON throughout the code keeps the internal model distinct from the wire format.
+Watchman expressions are built in a small helper layer and stored as `serde_json::Value`, keeping the wire-format construction localized to the Watchman integration.
 
 ### Planning
 
