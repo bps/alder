@@ -134,10 +134,13 @@ enum WatchmanCommand {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    run(cli)
+    match run(cli) {
+        Ok(code) => code,
+        Err(error) => error_exit(error),
+    }
 }
 
-fn run(cli: Cli) -> ExitCode {
+fn run(cli: Cli) -> Result<ExitCode, String> {
     let config_hint = cli
         .config
         .as_ref()
@@ -149,17 +152,17 @@ fn run(cli: Cli) -> ExitCode {
         Command::Ingest(args) => run_ingest(cli.config.as_deref(), cli.json, args),
         Command::Facts(args) => run_facts(cli.config.as_deref(), cli.json, args),
         Command::Explain(args) => run_explain(cli.config.as_deref(), cli.json, args),
-        Command::Test => stub(
+        Command::Test => Ok(stub(
             cli.json,
             "test",
             format!("would run fixture tests with config={config_hint}"),
-        ),
+        )),
         Command::Undo(args) => run_undo(cli.json, args),
-        Command::Watch => stub(
+        Command::Watch => Ok(stub(
             cli.json,
             "watch",
             format!("would use Watchman with config={config_hint}"),
-        ),
+        )),
         Command::Watchman(args) => run_watchman(cli.config.as_deref(), args),
     }
 }
@@ -169,21 +172,12 @@ fn run_paths(
     json: bool,
     paths: Vec<PathBuf>,
     dry_run: bool,
-) -> ExitCode {
-    let config_path = match resolve_config_path(config_path) {
-        Ok(path) => path,
-        Err(error) => return error_exit(error),
-    };
-    let config = match load_config(&config_path) {
-        Ok(config) => config,
-        Err(error) => return error_exit(error),
-    };
-    let roots = match destination_roots(&config) {
-        Ok(roots) => roots,
-        Err(error) => return error_exit(error),
-    };
+) -> Result<ExitCode, String> {
+    let config_path = resolve_config_path(config_path)?;
+    let config = load_config(&config_path)?;
+    let roots = destination_roots(&config)?;
     if !dry_run && roots.is_empty() {
-        return error_exit(
+        return Err(
             "non-dry-run execution requires defaults.destination_roots in config".to_string(),
         );
     }
@@ -198,50 +192,44 @@ fn run_paths(
     print_results(json, &results)
 }
 
-fn run_ingest(config_path: Option<&Path>, json: bool, args: IngestArgs) -> ExitCode {
+fn run_ingest(
+    config_path: Option<&Path>,
+    json: bool,
+    args: IngestArgs,
+) -> Result<ExitCode, String> {
     if args.from_watchman {
         return parse_watchman_ingest(config_path, json, args.dry_run);
     }
 
     if args.paths.is_empty() {
-        eprintln!("alder ingest: expected PATH... or --from-watchman");
-        return ExitCode::from(EXIT_ERROR);
+        return Err("ingest: expected PATH... or --from-watchman".to_string());
     }
 
     run_paths(config_path, json, args.paths, args.dry_run)
 }
 
-fn parse_watchman_ingest(config_path: Option<&Path>, json: bool, dry_run: bool) -> ExitCode {
-    let config_path = match resolve_config_path(config_path) {
-        Ok(path) => path,
-        Err(error) => return error_exit(error),
-    };
-    let config = match load_config(&config_path) {
-        Ok(config) => config,
-        Err(error) => return error_exit(error),
-    };
+fn parse_watchman_ingest(
+    config_path: Option<&Path>,
+    json: bool,
+    dry_run: bool,
+) -> Result<ExitCode, String> {
+    let config_path = resolve_config_path(config_path)?;
+    let config = load_config(&config_path)?;
     let Some(watch) = config.watch.as_ref() else {
-        return error_exit("config does not define watch settings".to_string());
+        return Err("config does not define watch settings".to_string());
     };
-    let root = match env::var_os("WATCHMAN_ROOT") {
-        Some(root) => PathBuf::from(root),
-        None => return error_exit("WATCHMAN_ROOT is required with --from-watchman".to_string()),
-    };
+    let root = env::var_os("WATCHMAN_ROOT")
+        .map(PathBuf::from)
+        .ok_or_else(|| "WATCHMAN_ROOT is required with --from-watchman".to_string())?;
 
     let mut input = String::new();
-    if let Err(error) = io::Read::read_to_string(&mut io::stdin(), &mut input) {
-        return error_exit(format!("failed to read Watchman stdin: {error}"));
-    }
-    let candidates = match parse_watchman_stdin(&input, root, watch) {
-        Ok(candidates) => candidates,
-        Err(error) => return error_exit(error.to_string()),
-    };
-    let roots = match destination_roots(&config) {
-        Ok(roots) => roots,
-        Err(error) => return error_exit(error),
-    };
+    io::Read::read_to_string(&mut io::stdin(), &mut input)
+        .map_err(|error| format!("failed to read Watchman stdin: {error}"))?;
+    let candidates =
+        parse_watchman_stdin(&input, root, watch).map_err(|error| error.to_string())?;
+    let roots = destination_roots(&config)?;
     if !dry_run && roots.is_empty() {
-        return error_exit(
+        return Err(
             "non-dry-run execution requires defaults.destination_roots in config".to_string(),
         );
     }
@@ -255,15 +243,13 @@ fn parse_watchman_ingest(config_path: Option<&Path>, json: bool, dry_run: bool) 
     print_results(json, &results)
 }
 
-fn run_facts(config_path: Option<&Path>, json: bool, args: FileOutputArgs) -> ExitCode {
-    let config_path = match resolve_config_path(config_path) {
-        Ok(path) => path,
-        Err(error) => return error_exit(error),
-    };
-    let config = match load_config(&config_path) {
-        Ok(config) => config,
-        Err(error) => return error_exit(error),
-    };
+fn run_facts(
+    config_path: Option<&Path>,
+    json: bool,
+    args: FileOutputArgs,
+) -> Result<ExitCode, String> {
+    let config_path = resolve_config_path(config_path)?;
+    let config = load_config(&config_path)?;
     let output = facts_for_file(&config, args.file);
     if json {
         print_json(&output)
@@ -274,90 +260,72 @@ fn run_facts(config_path: Option<&Path>, json: bool, args: FileOutputArgs) -> Ex
         for error in output.provider_errors {
             eprintln!("provider error: {error}");
         }
-        ExitCode::SUCCESS
+        Ok(ExitCode::SUCCESS)
     }
 }
 
-fn run_explain(config_path: Option<&Path>, json: bool, args: FileOutputArgs) -> ExitCode {
-    let config_path = match resolve_config_path(config_path) {
-        Ok(path) => path,
-        Err(error) => return error_exit(error),
-    };
-    let config = match load_config(&config_path) {
-        Ok(config) => config,
-        Err(error) => return error_exit(error),
-    };
+fn run_explain(
+    config_path: Option<&Path>,
+    json: bool,
+    args: FileOutputArgs,
+) -> Result<ExitCode, String> {
+    let config_path = resolve_config_path(config_path)?;
+    let config = load_config(&config_path)?;
     let result = explain_file(&config, args.file);
     if json {
         print_json(&result)
     } else {
         print_human_result(&result);
-        exit_for_results(std::slice::from_ref(&result))
+        Ok(exit_for_results(std::slice::from_ref(&result)))
     }
 }
 
-fn run_undo(json: bool, args: UndoArgs) -> ExitCode {
+fn run_undo(json: bool, args: UndoArgs) -> Result<ExitCode, String> {
     if !matches!(args.target.as_deref(), None | Some("last")) {
-        return error_exit(
-            "only `alder undo` and `alder undo last` are supported for now".to_string(),
-        );
+        return Err("only `alder undo` and `alder undo last` are supported for now".to_string());
     }
 
-    match undo_last_move(&default_action_log_path()) {
-        Ok(report) if json => print_json(&report),
-        Ok(report) => {
-            println!(
-                "Undid move: {} -> {}",
-                report.restored_from.display(),
-                report.restored_to.display()
-            );
-            ExitCode::SUCCESS
-        }
-        Err(error) => error_exit(error.to_string()),
+    let report = undo_last_move(&default_action_log_path()).map_err(|error| error.to_string())?;
+    if json {
+        print_json(&report)
+    } else {
+        println!(
+            "Undid move: {} -> {}",
+            report.restored_from.display(),
+            report.restored_to.display()
+        );
+        Ok(ExitCode::SUCCESS)
     }
 }
 
-fn run_watchman(config_path: Option<&Path>, args: WatchmanArgs) -> ExitCode {
-    let config_path = match resolve_config_path(config_path) {
-        Ok(path) => path,
-        Err(error) => return error_exit(error),
-    };
-    let config = match load_config(&config_path) {
-        Ok(config) => config,
-        Err(error) => return error_exit(error),
-    };
-    let alder_exe = match env::current_exe() {
-        Ok(path) => path,
-        Err(error) => return error_exit(format!("failed to locate current executable: {error}")),
-    };
+fn run_watchman(config_path: Option<&Path>, args: WatchmanArgs) -> Result<ExitCode, String> {
+    let config_path = resolve_config_path(config_path)?;
+    let config = load_config(&config_path)?;
+    let alder_exe = env::current_exe()
+        .map_err(|error| format!("failed to locate current executable: {error}"))?;
     let options = WatchmanGenerateOptions::new(config_path, alder_exe);
 
     match args.command {
         WatchmanCommand::Print => {
-            let commands = match generate_trigger_commands(&config, &options) {
-                Ok(commands) => commands,
-                Err(error) => return error_exit(error.to_string()),
-            };
-            match serde_json::to_string_pretty(&commands) {
-                Ok(output) => {
-                    println!("{output}");
-                    ExitCode::SUCCESS
-                }
-                Err(error) => error_exit(format!("failed to encode Watchman commands: {error}")),
-            }
+            let commands =
+                generate_trigger_commands(&config, &options).map_err(|error| error.to_string())?;
+            let output = serde_json::to_string_pretty(&commands)
+                .map_err(|error| format!("failed to encode Watchman commands: {error}"))?;
+            println!("{output}");
+            Ok(ExitCode::SUCCESS)
         }
-        WatchmanCommand::Sync => match watchman_sync(&config, &options) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => error_exit(error.to_string()),
-        },
-        WatchmanCommand::Check => match watchman_check(&config, &options) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => error_exit(error.to_string()),
-        },
-        WatchmanCommand::Unsync => match watchman_unsync(&config, &options) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => error_exit(error.to_string()),
-        },
+        WatchmanCommand::Sync => {
+            watchman_sync(&config, &options).map_err(|error| error.to_string())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        WatchmanCommand::Check => {
+            watchman_check(&config, &options).map_err(|error| error.to_string())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        WatchmanCommand::Unsync => {
+            watchman_unsync(&config, &options).map_err(|error| error.to_string())?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
@@ -403,25 +371,25 @@ fn default_run_id() -> String {
         .to_string()
 }
 
-fn print_results(json: bool, results: &[alder::pipeline::PipelineResult]) -> ExitCode {
+fn print_results(
+    json: bool,
+    results: &[alder::pipeline::PipelineResult],
+) -> Result<ExitCode, String> {
     if json {
         print_json(results)
     } else {
         for result in results {
             print_human_result(result);
         }
-        exit_for_results(results)
+        Ok(exit_for_results(results))
     }
 }
 
-fn print_json<T: serde::Serialize + ?Sized>(value: &T) -> ExitCode {
-    match serde_json::to_string_pretty(value) {
-        Ok(output) => {
-            println!("{output}");
-            ExitCode::SUCCESS
-        }
-        Err(error) => error_exit(format!("failed to encode JSON: {error}")),
-    }
+fn print_json<T: serde::Serialize + ?Sized>(value: &T) -> Result<ExitCode, String> {
+    let output = serde_json::to_string_pretty(value)
+        .map_err(|error| format!("failed to encode JSON: {error}"))?;
+    println!("{output}");
+    Ok(ExitCode::SUCCESS)
 }
 
 fn print_human_result(result: &alder::pipeline::PipelineResult) {
