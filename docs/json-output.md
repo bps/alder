@@ -129,7 +129,7 @@ Important fields:
 
 ```json
 {
-  "undone_action_id": "run:timestamp:/from:/to",
+  "undone_action_id": "550e8400-e29b-41d4-a716-446655440000",
   "restored_from": "/path/sorted/statement.pdf",
   "restored_to": "/path/inbox/statement.pdf",
   "status": "undone"

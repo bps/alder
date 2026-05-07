@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::config::ConflictPolicy;
 use crate::facts::file::{FileFactError, FileFacts};
@@ -175,7 +176,7 @@ fn execute_move(
 
     let sha256 = source_facts.sha256()?.to_string();
     let size = source_facts.size();
-    let action_id = new_action_id(&options.run_id, &source, &destination);
+    let action_id = new_action_id();
     let intent = ActionLogRecord::new(
         action_id.clone(),
         None,
@@ -260,7 +261,7 @@ fn dedupe_if_same_hash(
     fs::remove_file(&source)
         .map_err(|error| ExecuteError::io("remove duplicate source", &source, error))?;
 
-    let action_id = new_action_id(&options.run_id, &source, destination);
+    let action_id = new_action_id();
     let record = ActionLogRecord::new(
         action_id,
         None,
@@ -528,7 +529,7 @@ pub fn undo_last_move(action_log_path: &Path) -> Result<UndoReport, ExecuteError
             .map_err(|error| ExecuteError::io("create undo destination parent", parent, error))?;
     }
 
-    let undo_action_id = new_action_id(&record.run_id, &record.to, &record.from);
+    let undo_action_id = new_action_id();
     let intent = ActionLogRecord::new(
         undo_action_id.clone(),
         Some(record.action_id.clone()),
@@ -652,12 +653,8 @@ impl ActionLogRecord {
     }
 }
 
-fn new_action_id(run_id: &str, from: &Path, to: &Path) -> String {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{run_id}:{ts}:{}:{}", from.display(), to.display())
+fn new_action_id() -> String {
+    Uuid::new_v4().to_string()
 }
 
 #[derive(Debug, Error)]
@@ -767,6 +764,17 @@ mod tests {
         let log_text = fs::read_to_string(log).unwrap();
         assert!(log_text.contains(r#""status":"in_progress""#));
         assert!(log_text.contains(r#""status":"moved""#));
+    }
+
+    #[test]
+    fn action_ids_are_unique_uuids() {
+        let mut ids = std::collections::HashSet::new();
+
+        for _ in 0..1000 {
+            let action_id = new_action_id();
+            uuid::Uuid::parse_str(&action_id).unwrap();
+            assert!(ids.insert(action_id));
+        }
     }
 
     #[test]
