@@ -94,6 +94,20 @@ struct ActionLogRecord {
     reason: Option<String>,
 }
 
+struct ActionLogRecordInput<'a> {
+    action_id: String,
+    undoes_action_id: Option<String>,
+    run_id: &'a str,
+    rule_id: &'a str,
+    action: ActionKind,
+    status: ExecutionStatus,
+    from: &'a Path,
+    to: &'a Path,
+    sha256: Option<String>,
+    size: Option<u64>,
+    reason: Option<String>,
+}
+
 pub fn execute_plan(
     plan: &ActionPlan,
     options: &ExecuteOptions,
@@ -200,19 +214,19 @@ fn execute_move(
     let sha256 = source_facts.sha256()?.to_string();
     let size = source_facts.size();
     let action_id = new_action_id();
-    let intent = ActionLogRecord::new(
-        action_id.clone(),
-        None,
-        &options.run_id,
-        &plan.rule_id,
-        ActionKind::Move,
-        ExecutionStatus::InProgress,
-        &source,
-        &destination,
-        Some(sha256.clone()),
-        Some(size),
-        None,
-    );
+    let intent = ActionLogRecord::new(ActionLogRecordInput {
+        action_id: action_id.clone(),
+        undoes_action_id: None,
+        run_id: &options.run_id,
+        rule_id: &plan.rule_id,
+        action: ActionKind::Move,
+        status: ExecutionStatus::InProgress,
+        from: &source,
+        to: &destination,
+        sha256: Some(sha256.clone()),
+        size: Some(size),
+        reason: None,
+    });
     log.append(&intent)?;
 
     if let Some(parent) = destination.parent() {
@@ -223,19 +237,19 @@ fn execute_move(
 
     move_without_overwrite(&source, &destination)?;
 
-    let committed = ActionLogRecord::new(
+    let committed = ActionLogRecord::new(ActionLogRecordInput {
         action_id,
-        None,
-        &options.run_id,
-        &plan.rule_id,
-        ActionKind::Move,
-        ExecutionStatus::Moved,
-        &source,
-        &destination,
-        Some(sha256.clone()),
-        Some(size),
-        None,
-    );
+        undoes_action_id: None,
+        run_id: &options.run_id,
+        rule_id: &plan.rule_id,
+        action: ActionKind::Move,
+        status: ExecutionStatus::Moved,
+        from: &source,
+        to: &destination,
+        sha256: Some(sha256.clone()),
+        size: Some(size),
+        reason: None,
+    });
     log.append(&committed)?;
 
     Ok(ExecutionRecord {
@@ -285,19 +299,19 @@ fn dedupe_if_same_hash(
         .map_err(|error| ExecuteError::io("remove duplicate source", &source, error))?;
 
     let action_id = new_action_id();
-    let record = ActionLogRecord::new(
+    let record = ActionLogRecord::new(ActionLogRecordInput {
         action_id,
-        None,
-        &options.run_id,
-        &plan.rule_id,
-        ActionKind::Move,
-        ExecutionStatus::Deduped,
-        &source,
-        destination,
-        Some(source_hash.clone()),
-        Some(source_facts.size()),
-        Some("destination already has same hash; removed source duplicate".to_string()),
-    );
+        undoes_action_id: None,
+        run_id: &options.run_id,
+        rule_id: &plan.rule_id,
+        action: ActionKind::Move,
+        status: ExecutionStatus::Deduped,
+        from: &source,
+        to: destination,
+        sha256: Some(source_hash.clone()),
+        size: Some(source_facts.size()),
+        reason: Some("destination already has same hash; removed source duplicate".to_string()),
+    });
     log.append(&record)?;
 
     Ok(ExecutionRecord {
@@ -548,36 +562,36 @@ pub fn undo_last_move(action_log_path: &Path) -> Result<UndoReport, ExecuteError
     }
 
     let undo_action_id = new_action_id();
-    let intent = ActionLogRecord::new(
-        undo_action_id.clone(),
-        Some(record.action_id.clone()),
-        &record.run_id,
-        &record.rule_id,
-        ActionKind::UndoMove,
-        ExecutionStatus::InProgress,
-        &record.to,
-        &record.from,
-        record.sha256.clone(),
-        record.size,
-        Some("undo move".to_string()),
-    );
+    let intent = ActionLogRecord::new(ActionLogRecordInput {
+        action_id: undo_action_id.clone(),
+        undoes_action_id: Some(record.action_id.clone()),
+        run_id: &record.run_id,
+        rule_id: &record.rule_id,
+        action: ActionKind::UndoMove,
+        status: ExecutionStatus::InProgress,
+        from: &record.to,
+        to: &record.from,
+        sha256: record.sha256.clone(),
+        size: record.size,
+        reason: Some("undo move".to_string()),
+    });
     log.append(&intent)?;
 
     move_without_overwrite(&record.to, &record.from)?;
 
-    let undone = ActionLogRecord::new(
-        undo_action_id,
-        Some(record.action_id.clone()),
-        &record.run_id,
-        &record.rule_id,
-        ActionKind::UndoMove,
-        ExecutionStatus::Undone,
-        &record.to,
-        &record.from,
-        record.sha256.clone(),
-        record.size,
-        Some("undo move".to_string()),
-    );
+    let undone = ActionLogRecord::new(ActionLogRecordInput {
+        action_id: undo_action_id,
+        undoes_action_id: Some(record.action_id.clone()),
+        run_id: &record.run_id,
+        rule_id: &record.rule_id,
+        action: ActionKind::UndoMove,
+        status: ExecutionStatus::Undone,
+        from: &record.to,
+        to: &record.from,
+        sha256: record.sha256.clone(),
+        size: record.size,
+        reason: Some("undo move".to_string()),
+    });
     log.append(&undone)?;
 
     Ok(UndoReport {
@@ -639,19 +653,21 @@ fn reconcile_records(records: &[ActionLogRecord]) -> Vec<ReconcileFinding> {
 }
 
 impl ActionLogRecord {
-    fn new(
-        action_id: String,
-        undoes_action_id: Option<String>,
-        run_id: &str,
-        rule_id: &str,
-        action: ActionKind,
-        status: ExecutionStatus,
-        from: &Path,
-        to: &Path,
-        sha256: Option<String>,
-        size: Option<u64>,
-        reason: Option<String>,
-    ) -> Self {
+    fn new(input: ActionLogRecordInput<'_>) -> Self {
+        let ActionLogRecordInput {
+            action_id,
+            undoes_action_id,
+            run_id,
+            rule_id,
+            action,
+            status,
+            from,
+            to,
+            sha256,
+            size,
+            reason,
+        } = input;
+
         Self {
             schema_version: 1,
             ts_unix_ms: SystemTime::now()
@@ -988,19 +1004,19 @@ mod tests {
     fn reconcile_reports_orphan_in_progress_records() {
         let temp_dir = tempfile::tempdir().unwrap();
         let log = temp_dir.path().join("actions.jsonl");
-        let record = ActionLogRecord::new(
-            "action-1".to_string(),
-            None,
-            "run",
-            "rule",
-            ActionKind::Move,
-            ExecutionStatus::InProgress,
-            Path::new("/from"),
-            Path::new("/to"),
-            None,
-            None,
-            None,
-        );
+        let record = ActionLogRecord::new(ActionLogRecordInput {
+            action_id: "action-1".to_string(),
+            undoes_action_id: None,
+            run_id: "run",
+            rule_id: "rule",
+            action: ActionKind::Move,
+            status: ExecutionStatus::InProgress,
+            from: Path::new("/from"),
+            to: Path::new("/to"),
+            sha256: None,
+            size: None,
+            reason: None,
+        });
         {
             let mut action_log = ActionLog::open(&log).unwrap();
             action_log.append(&record).unwrap();
