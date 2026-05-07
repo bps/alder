@@ -455,11 +455,6 @@ impl ActionLog {
     }
 
     fn append(&mut self, record: &ActionLogRecord) -> Result<(), ExecuteError> {
-        use std::io::{Seek, SeekFrom};
-
-        self.file
-            .seek(SeekFrom::End(0))
-            .map_err(|error| ExecuteError::io("seek action log end", "action log", error))?;
         serde_json::to_writer(&mut self.file, record).map_err(ExecuteError::SerializeLog)?;
         self.file
             .write_all(b"\n")
