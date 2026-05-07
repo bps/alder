@@ -123,6 +123,8 @@ pub struct ExtractionDiagnostic {
     pub selected: Option<DateCandidateDiagnostic>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rejected: Vec<DateCandidateDiagnostic>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<DateConflictDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -132,6 +134,13 @@ pub struct DateCandidateDiagnostic {
     pub date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DateConflictDiagnostic {
+    pub matched_label: String,
+    pub text: String,
+    pub date: String,
 }
 
 struct DateExtraction {
@@ -183,6 +192,7 @@ fn extract_date_variable(
 
     let mut saw_label = false;
     let mut saw_rejected: Option<RejectedCandidate> = None;
+    let mut extraction: Option<DateExtraction> = None;
     for captures in label_regex.captures_iter(source) {
         let matched = captures.name("label").expect("label group exists");
         saw_label = true;
@@ -202,35 +212,48 @@ fn extract_date_variable(
             continue;
         }
         let window_name = window.name();
-        return if extractor.after.is_some() {
-            let selected = candidates
-                .iter()
-                .min_by_key(|candidate| candidate.start)
-                .expect("candidates is not empty")
-                .clone();
-            Ok(DateExtraction {
-                value: iso_date(selected.date),
-                diagnostic: diagnostic(
-                    name,
-                    extractor,
-                    Some(label.clone()),
-                    Some(matched.as_str().to_string()),
-                    Some(window_name),
-                    Some(selected),
-                    rejected,
-                ),
-            })
+        if extractor.after.is_some() {
+            let selected = select_after_candidate(&candidates);
+            if let Some(extraction) = &mut extraction {
+                add_conflict_if_needed(extraction, matched.as_str(), &selected);
+            } else {
+                extraction = Some(DateExtraction {
+                    value: iso_date(selected.date),
+                    diagnostic: diagnostic(
+                        name,
+                        extractor,
+                        Some(label.clone()),
+                        Some(matched.as_str().to_string()),
+                        Some(window_name),
+                        Some(selected),
+                        rejected,
+                    ),
+                });
+            }
         } else {
-            select_unique_date(
-                name,
-                extractor,
-                Some(label.clone()),
-                Some(matched.as_str().to_string()),
-                Some(window_name),
-                candidates,
-                rejected,
-            )
-        };
+            match extraction.as_mut() {
+                Some(extraction) => {
+                    if let Some(selected) = select_unique_candidate(&candidates) {
+                        add_conflict_if_needed(extraction, matched.as_str(), &selected);
+                    }
+                }
+                None => {
+                    extraction = Some(select_unique_date(
+                        name,
+                        extractor,
+                        Some(label.clone()),
+                        Some(matched.as_str().to_string()),
+                        Some(window_name),
+                        candidates,
+                        rejected,
+                    )?);
+                }
+            }
+        }
+    }
+
+    if let Some(extraction) = extraction {
+        return Ok(extraction);
     }
 
     if !saw_label {
@@ -246,6 +269,46 @@ fn extract_date_variable(
         variable: name.to_string(),
         fact: extractor.from.clone(),
     })
+}
+
+fn select_after_candidate(candidates: &[ParsedCandidate]) -> ParsedCandidate {
+    candidates
+        .iter()
+        .min_by_key(|candidate| candidate.start)
+        .expect("candidates is not empty")
+        .clone()
+}
+
+fn select_unique_candidate(candidates: &[ParsedCandidate]) -> Option<ParsedCandidate> {
+    let mut dates: Vec<NaiveDate> = Vec::new();
+    for candidate in candidates {
+        if !dates.contains(&candidate.date) {
+            dates.push(candidate.date);
+        }
+    }
+    if dates.len() == 1 {
+        Some(candidates[0].clone())
+    } else {
+        None
+    }
+}
+
+fn add_conflict_if_needed(
+    extraction: &mut DateExtraction,
+    matched_label: &str,
+    candidate: &ParsedCandidate,
+) {
+    let date = iso_date(candidate.date);
+    if date != extraction.value {
+        extraction
+            .diagnostic
+            .conflicts
+            .push(DateConflictDiagnostic {
+                matched_label: matched_label.to_string(),
+                text: candidate.text.clone(),
+                date,
+            });
+    }
 }
 
 fn select_unique_date(
@@ -351,6 +414,7 @@ fn diagnostic(
                 reason: Some(candidate.reason),
             })
             .collect(),
+        conflicts: Vec::new(),
     }
 }
 
@@ -997,6 +1061,71 @@ mod tests {
     }
 
     #[test]
+    fn date_extractor_after_reports_later_conflicting_label_dates() {
+        let extractors = extractors([date_extractor(
+            "statement_date",
+            DateExtractor {
+                from: "pdf.text".to_string(),
+                after: Some("Statement Date".to_string()),
+                near: None,
+                scope: None,
+                window: Some(DateWindow::SameLine),
+                formats: vec!["%m/%d/%Y".to_string()],
+                min_year: None,
+                max_year: None,
+            },
+        )]);
+        let facts = fact_strings([(
+            "pdf.text",
+            "Statement Date: 04/15/2026\nStatement Date: 05/15/2026",
+        )]);
+
+        let result = extract_variables_with_reference_year(&extractors, &facts, 2026).unwrap();
+
+        assert_eq!(result.variables["statement_date"], "2026-04-15");
+        assert_eq!(result.diagnostics[0].conflicts.len(), 1);
+        assert_eq!(
+            result.diagnostics[0].conflicts[0].matched_label,
+            "Statement Date:"
+        );
+        assert_eq!(result.diagnostics[0].conflicts[0].text, "05/15/2026");
+        assert_eq!(result.diagnostics[0].conflicts[0].date, "2026-05-15");
+
+        let json = serde_json::to_value(&result.diagnostics[0]).unwrap();
+        assert_eq!(json["conflicts"][0]["matched_label"], "Statement Date:");
+        assert_eq!(json["conflicts"][0]["date"], "2026-05-15");
+    }
+
+    #[test]
+    fn date_extractor_after_does_not_report_later_matching_label_date() {
+        let extractors = extractors([date_extractor(
+            "statement_date",
+            DateExtractor {
+                from: "pdf.text".to_string(),
+                after: Some("Statement Date".to_string()),
+                near: None,
+                scope: None,
+                window: Some(DateWindow::SameLine),
+                formats: vec!["%m/%d/%Y".to_string()],
+                min_year: None,
+                max_year: None,
+            },
+        )]);
+        let facts = fact_strings([(
+            "pdf.text",
+            "Statement Date: 04/15/2026\nStatement Date: 4/15/2026",
+        )]);
+
+        let result = extract_variables_with_reference_year(&extractors, &facts, 2026).unwrap();
+
+        assert_eq!(result.variables["statement_date"], "2026-04-15");
+        assert!(result.diagnostics[0].conflicts.is_empty());
+
+        let json = serde_json::to_value(&result.diagnostics[0]).unwrap();
+        assert!(json.get("conflicts").is_none());
+    }
+
+    #[test]
     fn date_extractor_near_allows_date_before_or_after_label_on_same_line() {
         let extractors = extractors([date_extractor(
             "bill_date",
@@ -1016,6 +1145,38 @@ mod tests {
         let result = extract_variables_with_reference_year(&extractors, &facts, 2026).unwrap();
 
         assert_eq!(result.variables["bill_date"], "2026-04-15");
+    }
+
+    #[test]
+    fn date_extractor_near_reports_later_conflicting_label_dates() {
+        let extractors = extractors([date_extractor(
+            "bill_date",
+            DateExtractor {
+                from: "pdf.text".to_string(),
+                after: None,
+                near: Some("Bill Date".to_string()),
+                scope: None,
+                window: None,
+                formats: vec!["%B %-d, %Y".to_string()],
+                min_year: None,
+                max_year: None,
+            },
+        )]);
+        let facts = fact_strings([(
+            "pdf.text",
+            "April 15, 2026    Bill Date\nMay 15, 2026    Bill Date",
+        )]);
+
+        let result = extract_variables_with_reference_year(&extractors, &facts, 2026).unwrap();
+
+        assert_eq!(result.variables["bill_date"], "2026-04-15");
+        assert_eq!(result.diagnostics[0].conflicts.len(), 1);
+        assert_eq!(
+            result.diagnostics[0].conflicts[0].matched_label,
+            "Bill Date"
+        );
+        assert_eq!(result.diagnostics[0].conflicts[0].text, "May 15, 2026");
+        assert_eq!(result.diagnostics[0].conflicts[0].date, "2026-05-15");
     }
 
     #[test]

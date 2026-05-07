@@ -186,8 +186,10 @@ Fields:
 Label matching is case-insensitive, collapses whitespace, allows optional
 whitespace around label punctuation, and accepts optional trailing punctuation
 such as `:`, `.`, `-`, or `#`. Ambiguous windows fail instead of choosing a date
-silently. JSON explain output includes date extraction diagnostics for selected
-labels and candidates.
+silently. The first label occurrence with a valid date still wins, but later
+matching label occurrences that would select a different valid date are reported
+as diagnostic conflicts. JSON explain output includes date extraction diagnostics
+for selected labels, candidates, and conflicts.
 
 ## Templates
 

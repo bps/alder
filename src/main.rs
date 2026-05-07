@@ -428,6 +428,12 @@ fn print_human_result(result: &alder::pipeline::PipelineResult) {
                         diagnostic.variable, diagnostic.fact, selected.text, date
                     );
                 }
+                for conflict in &diagnostic.conflicts {
+                    println!(
+                        "    Conflicting {} near {:?}: {:?} -> {}",
+                        diagnostic.variable, conflict.matched_label, conflict.text, conflict.date
+                    );
+                }
             }
             for action in &plan.actions {
                 println!("    {action:?}");
