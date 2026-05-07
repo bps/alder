@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::{env, fs, io};
 
@@ -145,10 +145,10 @@ fn run(cli: Cli) -> ExitCode {
         .unwrap_or_else(|| DEFAULT_CONFIG_CANDIDATES.join(" then "));
 
     match cli.command {
-        Command::Run(args) => run_paths(cli.config.as_ref(), cli.json, args.paths, args.dry_run),
-        Command::Ingest(args) => run_ingest(cli.config.as_ref(), cli.json, args),
-        Command::Facts(args) => run_facts(cli.config.as_ref(), cli.json, args),
-        Command::Explain(args) => run_explain(cli.config.as_ref(), cli.json, args),
+        Command::Run(args) => run_paths(cli.config.as_deref(), cli.json, args.paths, args.dry_run),
+        Command::Ingest(args) => run_ingest(cli.config.as_deref(), cli.json, args),
+        Command::Facts(args) => run_facts(cli.config.as_deref(), cli.json, args),
+        Command::Explain(args) => run_explain(cli.config.as_deref(), cli.json, args),
         Command::Test => stub(
             cli.json,
             "test",
@@ -160,12 +160,12 @@ fn run(cli: Cli) -> ExitCode {
             "watch",
             format!("would use Watchman with config={config_hint}"),
         ),
-        Command::Watchman(args) => run_watchman(cli.config.as_ref(), args),
+        Command::Watchman(args) => run_watchman(cli.config.as_deref(), args),
     }
 }
 
 fn run_paths(
-    config_path: Option<&PathBuf>,
+    config_path: Option<&Path>,
     json: bool,
     paths: Vec<PathBuf>,
     dry_run: bool,
@@ -198,7 +198,7 @@ fn run_paths(
     print_results(json, &results)
 }
 
-fn run_ingest(config_path: Option<&PathBuf>, json: bool, args: IngestArgs) -> ExitCode {
+fn run_ingest(config_path: Option<&Path>, json: bool, args: IngestArgs) -> ExitCode {
     if args.from_watchman {
         return parse_watchman_ingest(config_path, json, args.dry_run);
     }
@@ -211,7 +211,7 @@ fn run_ingest(config_path: Option<&PathBuf>, json: bool, args: IngestArgs) -> Ex
     run_paths(config_path, json, args.paths, args.dry_run)
 }
 
-fn parse_watchman_ingest(config_path: Option<&PathBuf>, json: bool, dry_run: bool) -> ExitCode {
+fn parse_watchman_ingest(config_path: Option<&Path>, json: bool, dry_run: bool) -> ExitCode {
     let config_path = match resolve_config_path(config_path) {
         Ok(path) => path,
         Err(error) => return error_exit(error),
@@ -255,7 +255,7 @@ fn parse_watchman_ingest(config_path: Option<&PathBuf>, json: bool, dry_run: boo
     print_results(json, &results)
 }
 
-fn run_facts(config_path: Option<&PathBuf>, json: bool, args: FileOutputArgs) -> ExitCode {
+fn run_facts(config_path: Option<&Path>, json: bool, args: FileOutputArgs) -> ExitCode {
     let config_path = match resolve_config_path(config_path) {
         Ok(path) => path,
         Err(error) => return error_exit(error),
@@ -278,7 +278,7 @@ fn run_facts(config_path: Option<&PathBuf>, json: bool, args: FileOutputArgs) ->
     }
 }
 
-fn run_explain(config_path: Option<&PathBuf>, json: bool, args: FileOutputArgs) -> ExitCode {
+fn run_explain(config_path: Option<&Path>, json: bool, args: FileOutputArgs) -> ExitCode {
     let config_path = match resolve_config_path(config_path) {
         Ok(path) => path,
         Err(error) => return error_exit(error),
@@ -317,7 +317,7 @@ fn run_undo(json: bool, args: UndoArgs) -> ExitCode {
     }
 }
 
-fn run_watchman(config_path: Option<&PathBuf>, args: WatchmanArgs) -> ExitCode {
+fn run_watchman(config_path: Option<&Path>, args: WatchmanArgs) -> ExitCode {
     let config_path = match resolve_config_path(config_path) {
         Ok(path) => path,
         Err(error) => return error_exit(error),
@@ -361,7 +361,7 @@ fn run_watchman(config_path: Option<&PathBuf>, args: WatchmanArgs) -> ExitCode {
     }
 }
 
-fn resolve_config_path(config_path: Option<&PathBuf>) -> Result<PathBuf, String> {
+fn resolve_config_path(config_path: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(path) = config_path {
         return std::path::absolute(path)
             .map_err(|error| format!("failed to resolve config path {}: {error}", path.display()));
@@ -382,7 +382,7 @@ fn resolve_config_path(config_path: Option<&PathBuf>) -> Result<PathBuf, String>
     ))
 }
 
-fn load_config(path: &PathBuf) -> Result<alder::config::Config, String> {
+fn load_config(path: &Path) -> Result<alder::config::Config, String> {
     let input = fs::read_to_string(path)
         .map_err(|error| format!("failed to read config {}: {error}", path.display()))?;
     parse_config_str(&input).map_err(|error| error.to_string())
