@@ -295,6 +295,23 @@ fn ingest_from_watchman_moves_only_matching_candidates() {
     assert!(!sandbox.sorted.join("ignored.pdf.tmp").exists());
 }
 
+#[test]
+fn stub_json_escapes_control_characters() {
+    let output = Command::new(alder())
+        .args(["--config", "rules\t.yaml", "--json", "test"])
+        .output()
+        .expect("failed to execute alder test command");
+
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    let json: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(json["status"], "not_implemented");
+    assert_eq!(json["command"], "test");
+    assert_eq!(
+        json["detail"],
+        "would run fixture tests with config=rules\t.yaml"
+    );
+}
+
 fn stderr(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }

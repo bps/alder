@@ -450,22 +450,19 @@ fn error_exit(error: String) -> ExitCode {
 fn stub(json: bool, command: &str, detail: String) -> ExitCode {
     if json {
         eprintln!(
-            r#"{{"status":"not_implemented","command":"{}","detail":"{}"}}"#,
-            escape_json(command),
-            escape_json(&detail)
+            "{}",
+            serde_json::json!({
+                "status": "not_implemented",
+                "command": command,
+                "detail": detail,
+            })
+            .to_string()
         );
     } else {
         eprintln!("alder {command}: not yet implemented: {detail}");
     }
 
     ExitCode::from(EXIT_NOT_IMPLEMENTED)
-}
-
-fn escape_json(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
 }
 
 #[cfg(test)]
