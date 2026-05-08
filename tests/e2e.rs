@@ -81,6 +81,8 @@ rules:
     fn command(&self) -> Command {
         let mut command = Command::new(alder());
         command.env("HOME", &self.home);
+        command.env("XDG_CONFIG_HOME", self.home.join(".config"));
+        command.env("XDG_DATA_HOME", self.home.join(".local/share"));
         command.arg("--config").arg(&self.config);
         command
     }
@@ -225,6 +227,68 @@ fn trash_restore_by_action_id_round_trips_in_platform_trash() {
         latest_log_record(&sandbox.action_log(), "undo_trash", "undone")["undoes_action_id"],
         action_id
     );
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+#[test]
+#[ignore = "touches the real OS Trash/Recycle Bin; set ALDER_RUN_REAL_OS_TRASH_TESTS=1 to run"]
+fn real_os_trash_run_and_undo_by_action_id() {
+    if std::env::var_os("ALDER_RUN_REAL_OS_TRASH_TESTS").is_none() {
+        eprintln!("skipping real OS trash test; set ALDER_RUN_REAL_OS_TRASH_TESTS=1 to allow it");
+        return;
+    }
+
+    let sandbox = TrashSandbox::new();
+    let source = sandbox.write_source(
+        &format!("alder-real-os-trash-test-{}.txt", uuid::Uuid::new_v4()),
+        b"real os trash integration test",
+    );
+    #[cfg(target_os = "windows")]
+    let _cleanup = WindowsTrashCleanup::new(source.clone());
+
+    let run_output = sandbox.run([
+        OsStr::new("--json"),
+        OsStr::new("run"),
+        sandbox.inbox.as_os_str(),
+    ]);
+
+    assert!(run_output.status.success(), "{}", stderr(&run_output));
+    assert!(!source.exists(), "source should have moved to OS trash");
+    let json: Value = serde_json::from_slice(&run_output.stdout).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 1);
+    assert_eq!(json[0]["execution"]["records"][0]["action"], "trash");
+    assert_eq!(json[0]["execution"]["records"][0]["status"], "trashed");
+
+    let trash_record = latest_log_record(&sandbox.action_log(), "trash", "trashed");
+    assert_eq!(trash_record["from"], source.to_string_lossy().as_ref());
+    assert!(
+        trash_record["trash_time_deleted"].is_i64(),
+        "expected restore metadata in trash record: {trash_record}"
+    );
+
+    let action_id = trash_record["action_id"].as_str().unwrap();
+    let undo_output = sandbox.run([
+        OsStr::new("--json"),
+        OsStr::new("undo"),
+        OsStr::new(action_id),
+    ]);
+
+    assert!(undo_output.status.success(), "{}", stderr(&undo_output));
+    assert_eq!(
+        fs::read(&source).unwrap(),
+        b"real os trash integration test"
+    );
+    let undo_json: Value = serde_json::from_slice(&undo_output.stdout).unwrap();
+    assert_eq!(undo_json["status"], "undone");
+    assert_eq!(undo_json["restored_to"], source.to_string_lossy().as_ref());
 }
 
 #[cfg(all(
@@ -517,6 +581,7 @@ rules:
         let mut command = Command::new(alder());
         command
             .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_DATA_HOME", &self.xdg_data_home)
             .arg("--config")
             .arg(&self.config);

@@ -19,6 +19,25 @@ Each test should:
 
 Avoid real Watchman server state in normal e2e tests. Use `watchman print` and `ingest --from-watchman` for deterministic coverage. Real `watchman sync/check` can remain a manual or ignored integration test because it depends on a local Watchman daemon.
 
+## Opt-in real OS trash tests
+
+The `real_os_trash_run_and_undo_by_action_id` integration test exercises Alder's `trash` action through the real operating-system Trash/Recycle Bin. It is ignored by default and also requires an explicit environment variable so routine test runs and broad `cargo test -- --ignored` runs do not unexpectedly touch the user's Trash.
+
+Run it only on supported Linux/Freedesktop-style Unix or Windows hosts:
+
+```sh
+ALDER_RUN_REAL_OS_TRASH_TESTS=1 cargo test --test e2e real_os_trash_run_and_undo_by_action_id -- --ignored --nocapture
+```
+
+The test creates a temporary source file named `alder-real-os-trash-test-<uuid>.txt`, runs the CLI so Alder calls `trash::delete`, verifies the action log restore metadata, and then runs `alder undo <action_id>` to restore the exact trash item through `trash::os_limited`. After restore, the temp directory cleanup removes the test file. On Windows, a test-only guard also attempts to purge only the exact original-path trash item if the test fails before undo and the item is visible through the current platform trash inventory.
+
+Safety notes:
+
+- the test keeps the source file and sandboxed `HOME` under the same temporary root, and sets `HOME`, `XDG_CONFIG_HOME`, and `XDG_DATA_HOME` for the Alder subprocess so logs and Freedesktop trash state use the sandbox where the platform honors those variables;
+- Windows Recycle Bin behavior is system-managed, so the test still uses a unique temp path and Alder's exact-action restore metadata;
+- if the process is interrupted or the platform ignores sandboxed trash locations, manually remove any `alder-real-os-trash-test-<uuid>.txt` item whose original path points inside the test temp directory;
+- macOS is intentionally not covered by this real-trash test because the `trash` crate does not expose the `os_limited` inventory/restore APIs Alder uses for automated cleanup there.
+
 ## Initial e2e cases
 
 ### Dry-run does not move files
