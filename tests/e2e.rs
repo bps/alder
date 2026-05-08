@@ -180,6 +180,107 @@ rules:
     assert_eq!(json.as_array().unwrap().len(), 0);
 }
 
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+#[test]
+fn trash_restore_by_action_id_round_trips_in_platform_trash() {
+    let sandbox = TrashSandbox::new();
+    let source = sandbox.write_source("roundtrip.txt", b"restore me");
+    #[cfg(target_os = "windows")]
+    let _cleanup = WindowsTrashCleanup::new(source.clone());
+
+    let run_output = sandbox.run([
+        OsStr::new("--json"),
+        OsStr::new("run"),
+        sandbox.inbox.as_os_str(),
+    ]);
+    assert!(run_output.status.success(), "{}", stderr(&run_output));
+    assert!(!source.exists());
+    let trash_record = latest_log_record(&sandbox.action_log(), "trash", "trashed");
+    let action_id = trash_record["action_id"].as_str().unwrap().to_string();
+    assert!(
+        trash_record["trash_time_deleted"].is_i64(),
+        "trash record should include platform restore metadata: {trash_record}"
+    );
+
+    let undo_output = sandbox.run([
+        OsStr::new("--json"),
+        OsStr::new("undo"),
+        OsStr::new(&action_id),
+    ]);
+
+    assert!(undo_output.status.success(), "{}", stderr(&undo_output));
+    assert_eq!(fs::read(&source).unwrap(), b"restore me");
+    let json: Value = serde_json::from_slice(&undo_output.stdout).unwrap();
+    assert_eq!(json["status"], "undone");
+    assert_eq!(json["undone_action_id"], action_id);
+    assert_eq!(
+        latest_log_record(&sandbox.action_log(), "undo_trash", "undone")["undoes_action_id"],
+        action_id
+    );
+}
+
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(target_os = "ios"),
+    not(target_os = "android")
+))]
+#[test]
+fn trash_restore_refuses_duplicate_same_original_path_matches() {
+    let sandbox = TrashSandbox::new();
+    let source = sandbox.write_source("duplicate.txt", b"same bytes");
+
+    let first_output = sandbox.run([OsStr::new("run"), sandbox.inbox.as_os_str()]);
+    assert!(first_output.status.success(), "{}", stderr(&first_output));
+    let first_record = latest_log_record(&sandbox.action_log(), "trash", "trashed");
+    let first_action_id = first_record["action_id"].as_str().unwrap().to_string();
+    assert!(first_record["trash_time_deleted"].is_i64());
+    let first_infos = sandbox.trashinfo_paths_for_source(&source);
+    assert_eq!(
+        first_infos.len(),
+        1,
+        "expected the test trash to be isolated under XDG_DATA_HOME/Trash/info"
+    );
+    let first_deletion_date = deletion_date(&first_infos[0]);
+
+    fs::write(&source, b"same bytes").unwrap();
+    let second_output = sandbox.run([OsStr::new("run"), sandbox.inbox.as_os_str()]);
+    assert!(second_output.status.success(), "{}", stderr(&second_output));
+    let second_infos: Vec<PathBuf> = sandbox
+        .trashinfo_paths_for_source(&source)
+        .into_iter()
+        .filter(|path| !first_infos.contains(path))
+        .collect();
+    assert_eq!(second_infos.len(), 1);
+    // Freedesktop trash records deletion times at one-second precision. Force the
+    // two real trash items to share Alder's conservative matching tuple
+    // (original path, deletion time, size), so restore must refuse ambiguity.
+    set_deletion_date(&second_infos[0], &first_deletion_date);
+
+    let undo_output = sandbox.run([OsStr::new("undo"), OsStr::new(&first_action_id)]);
+
+    assert!(!undo_output.status.success());
+    assert!(
+        stderr(&undo_output).contains("multiple trash items match action"),
+        "{}",
+        stderr(&undo_output)
+    );
+    assert!(!source.exists());
+    assert_eq!(sandbox.trashinfo_paths_for_source(&source).len(), 2);
+    assert_eq!(
+        latest_log_record(&sandbox.action_log(), "undo_trash", "failed")["undoes_action_id"],
+        first_action_id
+    );
+}
+
 #[test]
 fn undo_last_restores_last_move() {
     let sandbox = Sandbox::new();
@@ -346,6 +447,245 @@ fn stub_json_escapes_control_characters() {
         json["detail"],
         "would run fixture tests with config=rules\t.yaml"
     );
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+struct TrashSandbox {
+    _temp: tempfile::TempDir,
+    inbox: PathBuf,
+    home: PathBuf,
+    xdg_data_home: PathBuf,
+    config: PathBuf,
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+impl TrashSandbox {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let inbox = temp.path().join("inbox");
+        let home = temp.path().join("home");
+        let xdg_data_home = temp.path().join("xdg-data");
+        fs::create_dir_all(&inbox).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&xdg_data_home).unwrap();
+        let config = temp.path().join("alder.yaml");
+        fs::write(
+            &config,
+            r#"
+version: 1
+rules:
+  - id: trash-text
+    when: file.ext == ".txt"
+    actions:
+      - trash: {}
+"#,
+        )
+        .unwrap();
+
+        Self {
+            _temp: temp,
+            inbox,
+            home,
+            xdg_data_home,
+            config,
+        }
+    }
+
+    fn write_source(&self, name: &str, content: &[u8]) -> PathBuf {
+        let source = self.inbox.join(name);
+        fs::write(&source, content).unwrap();
+        source
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(alder());
+        command
+            .env("HOME", &self.home)
+            .env("XDG_DATA_HOME", &self.xdg_data_home)
+            .arg("--config")
+            .arg(&self.config);
+        command
+    }
+
+    fn run<I, S>(&self, args: I) -> Output
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.command()
+            .args(args)
+            .output()
+            .expect("failed to execute sandbox command")
+    }
+
+    fn action_log(&self) -> PathBuf {
+        self.home.join(".local/state/alder/actions.jsonl")
+    }
+
+    #[cfg(all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    ))]
+    fn trashinfo_paths_for_source(&self, source: &Path) -> Vec<PathBuf> {
+        let info_dir = self.xdg_data_home.join("Trash/info");
+        let mut paths: Vec<PathBuf> = fs::read_dir(&info_dir)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", info_dir.display()))
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| trashinfo_original_path(path).as_deref() == Some(source))
+            .collect();
+        paths.sort();
+        paths
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsTrashCleanup {
+    original_path: PathBuf,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsTrashCleanup {
+    fn new(original_path: PathBuf) -> Self {
+        Self { original_path }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsTrashCleanup {
+    fn drop(&mut self) {
+        let Ok(items) = trash::os_limited::list() else {
+            return;
+        };
+        let leftovers: Vec<_> = items
+            .into_iter()
+            .filter(|item| item.original_path() == self.original_path)
+            .collect();
+        let _ = trash::os_limited::purge_all(leftovers);
+    }
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+fn latest_log_record(log: &Path, action: &str, status: &str) -> Value {
+    fs::read_to_string(log)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", log.display()))
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .rev()
+        .find(|record| record["action"] == action && record["status"] == status)
+        .unwrap_or_else(|| panic!("missing {action}/{status} record in {}", log.display()))
+}
+
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(target_os = "ios"),
+    not(target_os = "android")
+))]
+fn deletion_date(trashinfo: &Path) -> String {
+    fs::read_to_string(trashinfo)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("DeletionDate=").map(str::to_string))
+        .unwrap_or_else(|| panic!("missing DeletionDate in {}", trashinfo.display()))
+}
+
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(target_os = "ios"),
+    not(target_os = "android")
+))]
+fn trashinfo_original_path(trashinfo: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let text = fs::read_to_string(trashinfo).ok()?;
+    let encoded = text.lines().find_map(|line| line.strip_prefix("Path="))?;
+    let decoded = percent_decode(encoded.as_bytes())?;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(decoded)))
+}
+
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(target_os = "ios"),
+    not(target_os = "android")
+))]
+fn percent_decode(input: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] == b'%' {
+            let high = input.get(index + 1).and_then(|byte| hex_value(*byte))?;
+            let low = input.get(index + 2).and_then(|byte| hex_value(*byte))?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(input[index]);
+            index += 1;
+        }
+    }
+    Some(decoded)
+}
+
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(target_os = "ios"),
+    not(target_os = "android")
+))]
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(target_os = "ios"),
+    not(target_os = "android")
+))]
+fn set_deletion_date(trashinfo: &Path, deletion_date: &str) {
+    let text = fs::read_to_string(trashinfo).unwrap();
+    let updated = text
+        .lines()
+        .map(|line| {
+            line.strip_prefix("DeletionDate=")
+                .map(|_| format!("DeletionDate={deletion_date}"))
+                .unwrap_or_else(|| line.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(trashinfo, format!("{updated}\n")).unwrap();
 }
 
 fn stderr(output: &std::process::Output) -> String {
