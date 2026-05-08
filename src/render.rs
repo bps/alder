@@ -280,17 +280,15 @@ fn select_after_candidate(candidates: &[ParsedCandidate]) -> ParsedCandidate {
 }
 
 fn select_unique_candidate(candidates: &[ParsedCandidate]) -> Option<ParsedCandidate> {
-    let mut dates: Vec<NaiveDate> = Vec::new();
-    for candidate in candidates {
-        if !dates.contains(&candidate.date) {
-            dates.push(candidate.date);
-        }
-    }
-    if dates.len() == 1 {
-        Some(candidates[0].clone())
-    } else {
-        None
-    }
+    unique_candidate_date(candidates).map(|_| candidates[0].clone())
+}
+
+fn unique_candidate_date(candidates: &[ParsedCandidate]) -> Option<NaiveDate> {
+    let first = candidates.first()?.date;
+    candidates
+        .iter()
+        .all(|candidate| candidate.date == first)
+        .then_some(first)
 }
 
 fn add_conflict_if_needed(
@@ -330,13 +328,7 @@ fn select_unique_date(
         });
     }
 
-    let mut dates: Vec<NaiveDate> = Vec::new();
-    for candidate in &candidates {
-        if !dates.contains(&candidate.date) {
-            dates.push(candidate.date);
-        }
-    }
-    if dates.len() > 1 {
+    if unique_candidate_date(&candidates).is_none() {
         let details = candidates
             .iter()
             .map(|candidate| format!("{} -> {}", candidate.text, iso_date(candidate.date)))
@@ -586,7 +578,7 @@ fn candidate_regex(formats: &[String]) -> Regex {
             && (format.contains("%m") || format.contains("%-m"))
             && (format.contains("%d") || format.contains("%-d"))
     }) {
-        pieces.push(r"\d{1,2}/\d{1,2}/\d{4}".to_string());
+        pieces.push(r"\d{1,2}/\d{1,2}/\d{4}");
     }
     if formats.iter().any(|format| {
         format.contains('-')
@@ -594,19 +586,19 @@ fn candidate_regex(formats: &[String]) -> Regex {
             && (format.contains("%m") || format.contains("%-m"))
             && (format.contains("%d") || format.contains("%-d"))
     }) {
-        pieces.push(r"\d{4}-\d{1,2}-\d{1,2}".to_string());
+        pieces.push(r"\d{4}-\d{1,2}-\d{1,2}");
     }
     if formats
         .iter()
         .any(|format| format.contains("%B") || format.contains("%b"))
     {
-        pieces.push(r"[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}".to_string());
+        pieces.push(r"[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}");
     }
     if formats.iter().any(|format| format == "%Y%m%d") {
-        pieces.push(r"\d{8}".to_string());
+        pieces.push(r"\d{8}");
     }
     if pieces.is_empty() {
-        pieces.push(r"\b\B".to_string());
+        pieces.push(r"\b\B");
     }
     Regex::new(&format!(r"(?i)({})", pieces.join("|"))).expect("candidate regex is valid")
 }

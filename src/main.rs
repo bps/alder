@@ -175,21 +175,7 @@ fn run_paths(
 ) -> Result<ExitCode, String> {
     let config_path = resolve_config_path(config_path)?;
     let config = load_config(&config_path)?;
-    let roots = destination_roots(&config)?;
-    if !dry_run && roots.is_empty() && config_needs_destination_roots(&config) {
-        return Err(
-            "non-dry-run execution requires defaults.destination_roots in config".to_string(),
-        );
-    }
-
-    let options = ProcessOptions {
-        dry_run,
-        destination_roots: roots,
-        action_log_path: default_action_log_path(),
-        run_id: default_run_id(),
-    };
-    let results = process_paths(&config, &paths, &options);
-    print_results(json, &results)
+    process_candidates(&config, json, &paths, dry_run)
 }
 
 fn run_ingest(
@@ -227,19 +213,29 @@ fn parse_watchman_ingest(
         .map_err(|error| format!("failed to read Watchman stdin: {error}"))?;
     let candidates =
         parse_watchman_stdin(&input, root, watch).map_err(|error| error.to_string())?;
-    let roots = destination_roots(&config)?;
-    if !dry_run && roots.is_empty() && config_needs_destination_roots(&config) {
+    process_candidates(&config, json, &candidates, dry_run)
+}
+
+fn process_candidates(
+    config: &Config,
+    json: bool,
+    paths: &[PathBuf],
+    dry_run: bool,
+) -> Result<ExitCode, String> {
+    let roots = destination_roots(config)?;
+    if !dry_run && roots.is_empty() && config_needs_destination_roots(config) {
         return Err(
             "non-dry-run execution requires defaults.destination_roots in config".to_string(),
         );
     }
+
     let options = ProcessOptions {
         dry_run,
         destination_roots: roots,
         action_log_path: default_action_log_path(),
         run_id: default_run_id(),
     };
-    let results = process_paths(&config, &candidates, &options);
+    let results = process_paths(config, paths, &options);
     print_results(json, &results)
 }
 
@@ -499,7 +495,6 @@ fn stub(json: bool, command: &str, detail: String) -> ExitCode {
                 "command": command,
                 "detail": detail,
             })
-            .to_string()
         );
     } else {
         eprintln!("alder {command}: not yet implemented: {detail}");

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -78,6 +79,15 @@ pub enum ExecutionStatus {
     Deduped,
     Trashed,
     Undone,
+}
+
+impl ExecutionStatus {
+    fn is_terminal_log_status(&self) -> bool {
+        matches!(
+            self,
+            Self::Moved | Self::Failed | Self::Trashed | Self::Undone
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -844,20 +854,12 @@ fn completed_trash_record_by_action_id(
 }
 
 fn latest_unundone_terminal_record(records: &[ActionLogRecord]) -> Option<&ActionLogRecord> {
-    let undone: std::collections::HashSet<&str> = records
-        .iter()
-        .filter(|record| record.status == ExecutionStatus::Undone)
-        .filter_map(|record| record.undoes_action_id.as_deref())
-        .collect();
+    let undone = undone_action_ids(records);
 
-    records.iter().rev().find(|record| {
-        !undone.contains(record.action_id.as_str())
-            && matches!(
-                (record.action, &record.status),
-                (ActionKind::Move, ExecutionStatus::Moved)
-                    | (ActionKind::Trash, ExecutionStatus::Trashed)
-            )
-    })
+    records
+        .iter()
+        .rev()
+        .find(|record| !is_undone(record, &undone) && is_user_visible_terminal_action(record))
 }
 
 pub fn reconcile_action_log(action_log_path: &Path) -> Result<Vec<ReconcileFinding>, ExecuteError> {
@@ -867,21 +869,34 @@ pub fn reconcile_action_log(action_log_path: &Path) -> Result<Vec<ReconcileFindi
 }
 
 fn latest_unundone_move(records: &[ActionLogRecord]) -> Option<ActionLogRecord> {
-    let undone: std::collections::HashSet<&str> = records
-        .iter()
-        .filter(|record| record.status == ExecutionStatus::Undone)
-        .filter_map(|record| record.undoes_action_id.as_deref())
-        .collect();
+    let undone = undone_action_ids(records);
 
     records
         .iter()
         .rev()
-        .find(|record| {
-            record.action == ActionKind::Move
-                && record.status == ExecutionStatus::Moved
-                && !undone.contains(record.action_id.as_str())
-        })
+        .find(|record| !is_undone(record, &undone) && is_completed_move(record))
         .cloned()
+}
+
+fn undone_action_ids(records: &[ActionLogRecord]) -> HashSet<&str> {
+    records
+        .iter()
+        .filter(|record| record.status == ExecutionStatus::Undone)
+        .filter_map(|record| record.undoes_action_id.as_deref())
+        .collect()
+}
+
+fn is_undone(record: &ActionLogRecord, undone: &HashSet<&str>) -> bool {
+    undone.contains(record.action_id.as_str())
+}
+
+fn is_completed_move(record: &ActionLogRecord) -> bool {
+    record.action == ActionKind::Move && record.status == ExecutionStatus::Moved
+}
+
+fn is_user_visible_terminal_action(record: &ActionLogRecord) -> bool {
+    is_completed_move(record)
+        || (record.action == ActionKind::Trash && record.status == ExecutionStatus::Trashed)
 }
 
 fn reconcile_records(records: &[ActionLogRecord]) -> Vec<ReconcileFinding> {
@@ -890,14 +905,7 @@ fn reconcile_records(records: &[ActionLogRecord]) -> Vec<ReconcileFinding> {
         .filter(|record| record.status == ExecutionStatus::InProgress)
         .filter(|record| {
             !records.iter().any(|later| {
-                later.action_id == record.action_id
-                    && matches!(
-                        later.status,
-                        ExecutionStatus::Moved
-                            | ExecutionStatus::Failed
-                            | ExecutionStatus::Trashed
-                            | ExecutionStatus::Undone
-                    )
+                later.action_id == record.action_id && later.status.is_terminal_log_status()
             })
         })
         .map(|record| ReconcileFinding {

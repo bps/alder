@@ -4,7 +4,7 @@ use indexmap::IndexMap;
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::config::{Action, Config, ConflictPolicy, Rule};
+use crate::config::{Action, Config, ConflictPolicy, DestinationAction, Rule};
 use crate::expr::{self, Value};
 use crate::render::{self, ExtractionDiagnostic, FactStrings};
 
@@ -108,30 +108,10 @@ fn build_plan(
 ) -> Result<ActionPlan, PlanError> {
     let extraction = render::extract_variables_with_diagnostics(&rule.extract, string_facts)?;
     let template_values = template_values(string_facts, &extraction.variables);
-    let mut planned_actions = Vec::new();
-
-    if let Some(action) = rule.actions.first() {
-        match action {
-            Action::Move(action) => {
-                let to = render::render_destination_path(&action.to, &template_values)?;
-                planned_actions.push(PlannedAction::Move {
-                    to,
-                    conflict: action
-                        .conflict
-                        .or_else(|| {
-                            config
-                                .defaults
-                                .as_ref()
-                                .and_then(|defaults| defaults.conflict)
-                        })
-                        .unwrap_or(ConflictPolicy::AppendCounter),
-                    terminal: true,
-                });
-            }
-            Action::Trash(_) => planned_actions.push(PlannedAction::Trash { terminal: true }),
-            other => return Err(PlanError::UnsupportedAction(other.kind_name())),
-        }
-    }
+    let actions = match rule.actions.first() {
+        Some(action) => vec![plan_action(config, action, &template_values)?],
+        None => Vec::new(),
+    };
 
     Ok(ActionPlan {
         source: source.to_path_buf(),
@@ -139,8 +119,36 @@ fn build_plan(
         rule_name: rule.name.clone(),
         variables: extraction.variables,
         extraction_diagnostics: extraction.diagnostics,
-        actions: planned_actions,
+        actions,
     })
+}
+
+fn plan_action(
+    config: &Config,
+    action: &Action,
+    template_values: &IndexMap<String, String>,
+) -> Result<PlannedAction, PlanError> {
+    match action {
+        Action::Move(action) => Ok(PlannedAction::Move {
+            to: render::render_destination_path(&action.to, template_values)?,
+            conflict: conflict_policy(config, action),
+            terminal: true,
+        }),
+        Action::Trash(_) => Ok(PlannedAction::Trash { terminal: true }),
+        other => Err(PlanError::UnsupportedAction(other.kind_name())),
+    }
+}
+
+fn conflict_policy(config: &Config, action: &DestinationAction) -> ConflictPolicy {
+    action
+        .conflict
+        .or_else(|| {
+            config
+                .defaults
+                .as_ref()
+                .and_then(|defaults| defaults.conflict)
+        })
+        .unwrap_or(ConflictPolicy::AppendCounter)
 }
 
 fn string_facts(facts: &IndexMap<String, Value>) -> FactStrings {

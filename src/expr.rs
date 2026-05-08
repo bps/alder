@@ -122,16 +122,7 @@ fn eval_call(
             expect_arity(name, args, 2)?;
             let haystack = args[0].eval(facts)?;
             let needle = expect_string(args[1].eval(facts)?)?;
-            Ok(Value::Bool(match haystack {
-                Value::String(haystack) => haystack.contains(&needle),
-                Value::Null => false,
-                other => {
-                    return Err(ExprError::TypeError(format!(
-                        "contains haystack must be string or null, got {}",
-                        other.type_name()
-                    )));
-                }
-            }))
+            eval_nullable_string_predicate(name, haystack, |haystack| haystack.contains(&needle))
         }
         "matches" => {
             expect_arity(name, args, 2)?;
@@ -141,16 +132,7 @@ fn eval_call(
                 pattern,
                 message: error.to_string(),
             })?;
-            Ok(Value::Bool(match haystack {
-                Value::String(haystack) => regex.is_match(&haystack),
-                Value::Null => false,
-                other => {
-                    return Err(ExprError::TypeError(format!(
-                        "matches haystack must be string or null, got {}",
-                        other.type_name()
-                    )));
-                }
-            }))
+            eval_nullable_string_predicate(name, haystack, |haystack| regex.is_match(haystack))
         }
         "lower" => {
             expect_arity(name, args, 1)?;
@@ -167,6 +149,23 @@ fn eval_call(
         }
         _ => Err(ExprError::UnknownFunction(name.to_string())),
     }
+}
+
+fn eval_nullable_string_predicate(
+    function: &str,
+    haystack: Value,
+    predicate: impl FnOnce(&str) -> bool,
+) -> Result<Value, ExprError> {
+    Ok(Value::Bool(match haystack {
+        Value::String(haystack) => predicate(&haystack),
+        Value::Null => false,
+        other => {
+            return Err(ExprError::TypeError(format!(
+                "{function} haystack must be string or null, got {}",
+                other.type_name()
+            )));
+        }
+    }))
 }
 
 fn expect_arity(name: &str, args: &[Expr], expected: usize) -> Result<(), ExprError> {

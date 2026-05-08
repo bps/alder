@@ -455,12 +455,12 @@ fn validate_extractor(rule_id: &str, name: &str, extractor: &Extractor, errors: 
         ));
     }
 
-    if let (Some(min_year), Some(max_year)) = (extractor.min_year, extractor.max_year) {
-        if min_year > max_year {
-            errors.push(format!(
-                "rule {rule_id:?} date extractor {name:?} min_year must be <= max_year"
-            ));
-        }
+    if let (Some(min_year), Some(max_year)) = (extractor.min_year, extractor.max_year)
+        && min_year > max_year
+    {
+        errors.push(format!(
+            "rule {rule_id:?} date extractor {name:?} min_year must be <= max_year"
+        ));
     }
 }
 

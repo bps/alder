@@ -4,15 +4,10 @@ use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
 pub fn expand_user_path(path: &str) -> Result<PathBuf, PathError> {
-    let expanded = if path == "~" || path.starts_with("~/") {
-        let home = std::env::var_os("HOME")
-            .filter(|home| !home.is_empty())
-            .ok_or(PathError::HomeUnavailable)?;
-        if path == "~" {
-            PathBuf::from(home)
-        } else {
-            PathBuf::from(home).join(&path[2..])
-        }
+    let expanded = if path == "~" {
+        home_dir()?
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        home_dir()?.join(rest)
     } else if path.starts_with('~') {
         return Err(PathError::UnsupportedTilde(path.to_string()));
     } else {
@@ -28,6 +23,13 @@ pub fn expand_user_path(path: &str) -> Result<PathBuf, PathError> {
             source,
         })
     }
+}
+
+fn home_dir() -> Result<PathBuf, PathError> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or(PathError::HomeUnavailable)
 }
 
 fn normalize_no_parent(path: &Path) -> Result<PathBuf, PathError> {
