@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use indexmap::IndexMap;
 use serde::Serialize;
 
-use crate::config::Config;
+use crate::config::{Config, Rule};
 use crate::execute::{ExecuteOptions, ExecutionReport, execute_plan};
 use crate::expr::{self, Value};
 use crate::facts::file::FileFacts;
@@ -239,7 +239,7 @@ pub fn process_paths(
 
 pub fn explain_file(config: &Config, path: impl AsRef<Path>) -> PipelineResult {
     let source = path.as_ref().to_path_buf();
-    let facts_output = facts_for_file(config, &source);
+    let facts_output = planning_facts_for_file(config, &source);
     let (explanation, error) = match plan_for_file(config, &source, &facts_output.facts) {
         Ok(explanation) => (Some(explanation), None),
         Err(error) => (None, Some(error.to_string())),
@@ -256,11 +256,31 @@ pub fn explain_file(config: &Config, path: impl AsRef<Path>) -> PipelineResult {
 }
 
 pub fn facts_for_file(config: &Config, path: impl AsRef<Path>) -> FactsOutput {
+    let required = required_facts(config);
+    facts_for_file_with_required(path, &required)
+}
+
+fn planning_facts_for_file(config: &Config, path: impl AsRef<Path>) -> FactsOutput {
+    let source = path.as_ref().to_path_buf();
+    let predicate_required = predicate_required_facts(config);
+    let mut output = facts_for_file_with_required(&source, &predicate_required);
+
+    if let Some(rule) = first_matching_rule(config, &output.facts) {
+        let missing = missing_extractor_facts(rule, &output.facts);
+        if !missing.keys.is_empty() {
+            let extra = facts_for_file_with_required(&source, &missing);
+            merge_facts_output(&mut output, extra);
+        }
+    }
+
+    output
+}
+
+fn facts_for_file_with_required(path: impl AsRef<Path>, required: &RequiredFacts) -> FactsOutput {
     let source = path.as_ref().to_path_buf();
     let mut facts = IndexMap::new();
     let mut provider_errors = Vec::new();
     let mut provider_reports = Vec::new();
-    let required = required_facts(config);
 
     match FileFacts::from_path(&source) {
         Ok(file) => {
@@ -272,7 +292,7 @@ pub fn facts_for_file(config: &Config, path: impl AsRef<Path>) -> FactsOutput {
 
             for provider in providers {
                 let provider_name = provider.name();
-                match provider.applies(&file, &required) {
+                match provider.applies(&file, required) {
                     Applicability::Required => match provider.collect(&file) {
                         Ok(produced) => {
                             let produced_keys = produced.keys().cloned().collect();
@@ -289,7 +309,7 @@ pub fn facts_for_file(config: &Config, path: impl AsRef<Path>) -> FactsOutput {
                             provider_reports.push(ProviderReport {
                                 provider: provider_name,
                                 status: ProviderStatus::Error,
-                                facts: provider.report_facts(&required),
+                                facts: provider.report_facts(required),
                                 message: Some(message),
                             });
                         }
@@ -303,7 +323,7 @@ pub fn facts_for_file(config: &Config, path: impl AsRef<Path>) -> FactsOutput {
                     Applicability::Skipped(message) => provider_reports.push(ProviderReport {
                         provider: provider_name,
                         status: ProviderStatus::Skipped,
-                        facts: provider.report_facts(&required),
+                        facts: provider.report_facts(required),
                         message: Some(message),
                     }),
                 }
@@ -329,6 +349,49 @@ pub fn facts_for_file(config: &Config, path: impl AsRef<Path>) -> FactsOutput {
     }
 }
 
+fn first_matching_rule<'a>(
+    config: &'a Config,
+    facts: &IndexMap<String, Value>,
+) -> Option<&'a Rule> {
+    config
+        .rules
+        .iter()
+        .find(|rule| matches!(expr::eval_bool(&rule.when, facts), Ok(true)))
+}
+
+fn missing_extractor_facts(rule: &Rule, facts: &IndexMap<String, Value>) -> RequiredFacts {
+    RequiredFacts {
+        keys: rule
+            .extract
+            .values()
+            .map(|extractor| extractor.from().to_string())
+            .filter(|key| !facts.contains_key(key))
+            .collect(),
+    }
+}
+
+fn merge_facts_output(output: &mut FactsOutput, extra: FactsOutput) {
+    output.facts.extend(extra.facts);
+    output.provider_errors.extend(extra.provider_errors);
+    for report in extra.provider_reports {
+        if report.provider == FactProvider::File || report.status == ProviderStatus::NotRequired {
+            continue;
+        }
+        upsert_provider_report(&mut output.provider_reports, report);
+    }
+}
+
+fn upsert_provider_report(reports: &mut Vec<ProviderReport>, report: ProviderReport) {
+    if let Some(existing) = reports
+        .iter_mut()
+        .find(|existing| existing.provider == report.provider)
+    {
+        *existing = report;
+    } else {
+        reports.push(report);
+    }
+}
+
 pub fn destination_roots(config: &Config) -> Result<Vec<PathBuf>, String> {
     let roots = config
         .defaults
@@ -343,7 +406,7 @@ pub fn destination_roots(config: &Config) -> Result<Vec<PathBuf>, String> {
 }
 
 fn process_file(config: &Config, source: PathBuf, options: &ProcessOptions) -> PipelineResult {
-    let facts_output = facts_for_file(config, &source);
+    let facts_output = planning_facts_for_file(config, &source);
     let mut error = None;
     let explanation = match plan_for_file(config, &source, &facts_output.facts) {
         Ok(explanation) => Some(explanation),
@@ -418,14 +481,23 @@ fn collect_path(path: &Path, files: &mut Vec<PathBuf>) {
 }
 
 pub fn required_facts(config: &Config) -> RequiredFacts {
+    let mut required = predicate_required_facts(config);
+
+    for rule in &config.rules {
+        for extractor in rule.extract.values() {
+            required.keys.insert(extractor.from().to_string());
+        }
+    }
+
+    required
+}
+
+fn predicate_required_facts(config: &Config) -> RequiredFacts {
     let mut keys = BTreeSet::new();
 
     for rule in &config.rules {
         if let Ok(identifiers) = expr::identifiers(&rule.when) {
             keys.extend(identifiers);
-        }
-        for extractor in rule.extract.values() {
-            keys.insert(extractor.from().to_string());
         }
     }
 
@@ -575,6 +647,86 @@ rules:
         assert!(facts.provider_reports.iter().any(|report| {
             report.provider == FactProvider::Pdf && report.status == ProviderStatus::NotRequired
         }));
+    }
+
+    #[test]
+    fn planning_skips_pdf_extractor_for_nonmatching_rule() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("statement.pdf");
+        fs::write(&file, b"fake").unwrap();
+        let config = parse_config_str(&format!(
+            r#"
+version: 1
+rules:
+  - id: txt_only
+    when: file.ext == ".txt"
+    extract:
+      title:
+        from: pdf.text
+        regex: "(.*)"
+    actions:
+      - move:
+          to: "{}/{{{{ title }}}}.pdf"
+"#,
+            temp.path().display()
+        ))
+        .unwrap();
+
+        let result = explain_file(&config, &file);
+        let pdf_report = result
+            .provider_reports
+            .iter()
+            .find(|report| report.provider == FactProvider::Pdf)
+            .unwrap();
+
+        assert_eq!(pdf_report.status, ProviderStatus::NotRequired);
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(
+            result
+                .explanation
+                .as_ref()
+                .is_some_and(|explanation| explanation.plan.is_none())
+        );
+    }
+
+    #[test]
+    fn planning_reports_pdf_extractor_after_rule_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("notes.txt");
+        fs::write(&file, b"not a pdf").unwrap();
+        let config = parse_config_str(&format!(
+            r#"
+version: 1
+rules:
+  - id: txt_with_pdf_extractor
+    when: file.ext == ".txt"
+    extract:
+      title:
+        from: pdf.text
+        regex: "(.*)"
+    actions:
+      - move:
+          to: "{}/{{{{ title }}}}.pdf"
+"#,
+            temp.path().display()
+        ))
+        .unwrap();
+
+        let result = explain_file(&config, &file);
+        let pdf_report = result
+            .provider_reports
+            .iter()
+            .find(|report| report.provider == FactProvider::Pdf)
+            .unwrap();
+
+        assert_eq!(pdf_report.status, ProviderStatus::Skipped);
+        assert_eq!(pdf_report.message.as_deref(), Some("source is not a PDF"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("missing fact"))
+        );
     }
 
     #[test]
