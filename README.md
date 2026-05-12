@@ -31,6 +31,19 @@ Alder can currently:
 
 The implementation is still a prototype. The expression engine is provisional, JSON output is not yet versioned, and only move and trash actions are executed.
 
+## Installation from source
+
+Alder is not published as a package yet. Install it from a clone with Rust 1.89 or newer:
+
+```sh
+git clone https://github.com/bps/alder.git
+cd alder
+cargo test --all-features --locked
+cargo install --path .
+```
+
+For development checks, see [Contributing](CONTRIBUTING.md).
+
 ## Documentation
 
 Start with:
