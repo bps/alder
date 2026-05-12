@@ -23,13 +23,14 @@ Alder can currently:
 - dry-run and explain move plans;
 - execute safe move actions inside explicit destination roots;
 - execute OS-specific trash actions using the user's Trash/Recycle Bin;
+- on macOS, scan `.app` bundles for candidate supporting files in `~/Library` for user review;
 - handle conflicts including `append_counter` and `replace_if_same_hash`;
 - append action-log records;
 - conservatively undo the last move, and restore exactly identified trash actions by action ID where the platform exposes Trash/Recycle Bin inventory APIs;
 - generate and sync Watchman triggers that invoke Alder directly;
 - run e2e CLI tests for the main workflow.
 
-The implementation is still a prototype. The expression engine is provisional, JSON output is not yet versioned, and only move and trash actions are executed.
+The implementation is still a prototype. The expression engine is provisional, JSON output is not yet versioned, and only move, trash, and app-support scan actions are executed.
 
 ## Installation from source
 
@@ -43,6 +44,15 @@ cargo install --path .
 ```
 
 For development checks, see [Contributing](CONTRIBUTING.md).
+
+## Default config discovery
+
+Alder loads the first config found in this order:
+
+1. An explicit `--config PATH`.
+2. `./alder.yaml`, then `./alder.yml` in the current working directory.
+3. `$XDG_CONFIG_HOME/alder/alder.yaml`, then `.yml`.
+4. `$HOME/.config/alder/alder.yaml`, then `.yml`, when `XDG_CONFIG_HOME` is unset, empty, or relative.
 
 ## Documentation
 
@@ -70,6 +80,7 @@ Design and background:
 - `src/facts/` — file, PDF, and Spotlight fact providers.
 - `src/render.rs` — extraction and template rendering.
 - `src/planning.rs` — rules to action plans.
+- `src/app_support.rs` — macOS app bundle support-file candidate scanning.
 - `src/execute.rs` — move execution, conflict handling, action logs, undo.
 - `src/watchman.rs` — Watchman trigger generation and sync.
 - `src/pipeline.rs` — CLI-facing orchestration.

@@ -17,7 +17,7 @@ The current JSON shapes are useful for tests and local automation, but they are 
       {
         "provider": "file",
         "status": "invoked",
-        "facts": ["file.path", "file.name", "file.stem", "file.ext", "file.size"],
+        "facts": ["file.path", "file.name", "file.stem", "file.ext", "file.kind", "file.size"],
         "message": null
       }
     ],
@@ -78,11 +78,31 @@ Execution statuses currently include:
 - `failed`
 - `deduped`
 - `trashed`
+- `scanned`
 - `undone`
 
 For dry-runs, execution records use `planned` and no filesystem mutation occurs.
 
 Trash execution records use `action: "trash"`. They have no Alder destination path, so `destination` is `null`; the `reason` explains that the source is moved to the operating system Trash/Recycle Bin. Trash records include the source size but leave `sha256` as `null` to avoid hashing large files when Alder will not use the hash for automatic restore.
+
+macOS app support scans use `action: "scan_app_supporting_files"` and `status: "scanned"`. They do not delete anything. The execution record includes a `supporting_files` array when matching candidate support paths were found.
+
+```json
+{
+  "action": "scan_app_supporting_files",
+  "source": "/Applications/Example.app",
+  "destination": null,
+  "status": "scanned",
+  "reason": "candidate macOS app supporting files for com.example.Example",
+  "rule_id": "removed-apps",
+  "sha256": null,
+  "size": null,
+  "supporting_files": [
+    "/Users/me/Library/Preferences/com.example.Example.plist",
+    "/Users/me/Library/Caches/com.example.Example"
+  ]
+}
+```
 
 ## `facts --json`
 
@@ -93,7 +113,8 @@ Trash execution records use `action: "trash"`. They have no Alder destination pa
   "source": "/path/file.pdf",
   "facts": {
     "file.name": { "type": "string", "value": "file.pdf" },
-    "file.ext": { "type": "string", "value": ".pdf" }
+    "file.ext": { "type": "string", "value": ".pdf" },
+    "file.kind": { "type": "string", "value": "file" }
   },
   "provider_errors": [],
   "provider_reports": [
@@ -194,6 +215,12 @@ Trash restore by action ID writes:
 Hash dedupe writes:
 
 - `action = "move", status = "deduped"`
+
+macOS app support scans write:
+
+- `action = "scan_app_supporting_files", status = "scanned"`
+
+Scan records include a `supporting_files` array containing the existing candidate paths found under `~/Library`.
 
 Each action log record includes a per-action `action_id` for pairing and reconciliation.
 

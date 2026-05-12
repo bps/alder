@@ -110,7 +110,7 @@ Fields:
 | `name` | string | unset | Human-readable label. |
 | `when` | expression string | required | Provisional CEL-like expression. Must evaluate to bool. |
 | `extract` | map | `{}` | Regex extractors keyed by variable name. |
-| `actions` | list | required non-empty | Currently `move` and `trash` are executed. Other action shapes parse but planning reports unsupported. |
+| `actions` | list | required non-empty | Currently `move`, `trash`, and `scan_app_supporting_files` are executed. Other action shapes parse but planning reports unsupported. |
 
 ## Expressions
 
@@ -128,6 +128,10 @@ Supported:
   - `contains(haystack, needle)`
   - `matches(haystack, regex)`
   - `lower(value)`
+  - `older_than(unix_seconds, duration)` where duration uses `s`, `m`, `h`, `d`, or `w`
+  - `before_start_of_week(unix_seconds, week_start)` where week start is `sunday`, `monday`, etc.
+
+Time predicates usually use `file.created_at_unix` or `file.modified_at_unix`, which are Unix-second numeric file facts. `file.kind` is `file` for regular files and `app_bundle` for macOS `.app` bundle directories.
 
 Example:
 
@@ -170,6 +174,19 @@ extract:
     formats: ["%m/%d/%Y", "%Y-%m-%d", "%B %-d, %Y", "%b %-d, %Y"]
 ```
 
+For statement-period ranges, select the last date in the window explicitly:
+
+```yaml
+extract:
+  stmt_date:
+    kind: date
+    from: pdf.text
+    near: "days in Billing Cycle"
+    window: same_line
+    select: last
+    formats: ["%B %-d, %Y", "%b %-d, %Y"]
+```
+
 Fields:
 
 | Field | Type | Notes |
@@ -180,6 +197,7 @@ Fields:
 | `near` | string | Match a normalized literal label and require exactly one distinct valid date in the window. |
 | `scope` | `document` | Scan the whole fact and require exactly one distinct valid date. Conservative escape hatch for already-specific rules. |
 | `window` | `same_line`, `next_line`, `paragraph`, or `chars:N` | Defaults to `next_line` for `after` and `same_line` for `near`. |
+| `select` | `first`, `last`, or `unique` | Optional candidate selector. Defaults to `first` for `after` and `unique` for `near` / `scope: document`. |
 | `formats` | list of chrono date formats | Required and non-empty. Compact `%Y%m%d` candidates are scanned only when this format is listed. |
 | `min_year` / `max_year` | integer | Optional year bounds. Defaults are `1990` and current year + 1. |
 
@@ -254,7 +272,34 @@ Safety behavior:
 - `alder undo` and `alder undo last` do not automatically restore trash actions. If the latest action is `trash`, they refuse rather than reaching past it to undo an older move;
 - `alder undo <action_id>` accepts an action ID UUID and can restore a trash action only when the source path is absent and the current Trash/Recycle Bin has exactly one item matching the logged original path, deletion time, and size. macOS currently refuses automatic trash restore because the required inventory/restore APIs are unavailable.
 
-`move` and `trash` are executed by the current CLI pipeline.
+## Scan app supporting files action
+
+```yaml
+actions:
+  - scan_app_supporting_files:
+```
+
+`scan_app_supporting_files` has no fields today. It is a macOS-only, non-destructive action for `.app` bundle sources. It parses the bundle's `Contents/Info.plist`, reads `CFBundleIdentifier`, and logs existing candidate support paths under the user's `~/Library`, such as preferences, caches, application support, containers, saved application state, logs, application scripts, and launch agents.
+
+Example rule:
+
+```yaml
+rules:
+  - id: removed-apps
+    when: file.ext == ".app" && file.kind == "app_bundle"
+    actions:
+      - scan_app_supporting_files:
+```
+
+Safety behavior:
+
+- the action only scans and logs candidate paths; it never deletes support files;
+- dry-runs produce a planned `scan_app_supporting_files` execution record and do not mutate the filesystem or action log;
+- non-dry-run scans append an action-log record with `status: "scanned"` and a structured `supporting_files` path list;
+- only `.app` bundle directories are accepted as sources;
+- on non-macOS platforms, execution reports that the action is unsupported.
+
+`move`, `trash`, and `scan_app_supporting_files` are executed by the current CLI pipeline. Regular file actions such as `move` and `trash` are rejected for app bundle sources.
 
 Other parsed action shapes:
 

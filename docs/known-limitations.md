@@ -6,11 +6,11 @@ This document separates intentional scope boundaries from planned gaps and exter
 
 ### Alder is not a general automation platform
 
-The current implementation focuses on explainable file routing. It intentionally does not provide arbitrary shell/Python actions, notifications, or broad workflow orchestration.
+The current implementation focuses on explainable file routing. It intentionally does not provide arbitrary shell/Python actions or broad workflow orchestration. On macOS, CLI execution emits best-effort status notifications via `osascript`; these are informational notifications without custom action buttons.
 
-### Only move and trash actions execute
+### Only a small action set executes
 
-The config schema can parse other actions, but only `move` and `trash` are planned and executed today. Unsupported actions fail during planning.
+The config schema can parse several action placeholders, but only `move`, `trash`, and non-destructive `scan_app_supporting_files` are planned and executed today. Unsupported actions fail during planning.
 
 ### Destination roots are required for execution
 

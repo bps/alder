@@ -367,9 +367,9 @@ Unit tests should cover:
 - legacy regex extractor compatibility;
 - canonical `YYYY-MM-DD` template output.
 
-Fixture tests should use representative PDF text extracted from converted Hazel
-rule families, especially documents currently marked with `TODO(date-matching)`
-in `docs/local-private-rules.alder.yaml`.
+Fixture tests should use representative, redacted PDF text from local rule
+corpora. Keep private corpora and converted personal rule files outside the
+published repository, and commit only generic fixtures.
 
 ## Open follow-up decisions
 
