@@ -1,5 +1,8 @@
+#[cfg(any(target_os = "macos", test))]
 use std::collections::BTreeSet;
+#[cfg(target_os = "macos")]
 use std::env;
+#[cfg(any(target_os = "macos", test))]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -26,6 +29,7 @@ pub fn scan_app_supporting_files(app: &Path) -> Result<AppSupportScan, AppSuppor
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn scan_app_supporting_files_in_library(
     app: &Path,
     library: &Path,
@@ -65,6 +69,7 @@ pub(crate) fn scan_app_supporting_files_in_library(
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn validate_app_bundle(app: &Path) -> Result<(), AppSupportError> {
     let metadata = fs::metadata(app).map_err(|source| AppSupportError::Io {
         op: "read app bundle metadata",
@@ -79,6 +84,7 @@ fn validate_app_bundle(app: &Path) -> Result<(), AppSupportError> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn app_names(app: &Path, plist: &plist::Value) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for key in ["CFBundleName", "CFBundleDisplayName"] {
@@ -94,6 +100,7 @@ fn app_names(app: &Path, plist: &plist::Value) -> BTreeSet<String> {
     names
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn plist_string<'a>(plist: &'a plist::Value, key: &str) -> Option<&'a str> {
     plist
         .as_dictionary()
@@ -101,6 +108,7 @@ fn plist_string<'a>(plist: &'a plist::Value, key: &str) -> Option<&'a str> {
         .and_then(|value| value.as_string())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn validate_bundle_identifier(bundle_id: &str) -> Result<(), AppSupportError> {
     let valid_chars = bundle_id
         .chars()
@@ -117,6 +125,7 @@ fn validate_bundle_identifier(bundle_id: &str) -> Result<(), AppSupportError> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn safe_app_name(name: &str) -> bool {
     let trimmed = name.trim();
     if trimmed.len() < 4 || trimmed.contains('/') || trimmed.contains(':') || trimmed.contains('\0')
@@ -129,6 +138,7 @@ fn safe_app_name(name: &str) -> bool {
     )
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn add_bundle_id_candidates(library: &Path, bundle_id: &str, candidates: &mut BTreeSet<PathBuf>) {
     add_if_exists(
         library.join("Application Support").join(bundle_id),
@@ -161,18 +171,21 @@ fn add_bundle_id_candidates(library: &Path, bundle_id: &str, candidates: &mut BT
     );
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn add_name_candidates(library: &Path, name: &str, candidates: &mut BTreeSet<PathBuf>) {
     add_if_exists(library.join("Application Support").join(name), candidates);
     add_if_exists(library.join("Caches").join(name), candidates);
     add_if_exists(library.join("Logs").join(name), candidates);
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn add_if_exists(path: PathBuf, candidates: &mut BTreeSet<PathBuf>) {
     if path.exists() {
         candidates.insert(path);
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn add_matching_children(
     directory: &Path,
     matches: impl Fn(&str) -> bool,
@@ -191,6 +204,7 @@ fn add_matching_children(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn preference_matches_bundle_id(name: &str, bundle_id: &str) -> bool {
     name == format!("{bundle_id}.plist")
         || name
@@ -198,12 +212,14 @@ fn preference_matches_bundle_id(name: &str, bundle_id: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with('-'))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn group_container_matches_bundle_id(name: &str, bundle_id: &str) -> bool {
     name == bundle_id
         || name == format!("group.{bundle_id}")
         || name.ends_with(&format!(".{bundle_id}"))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn is_app_bundle_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
