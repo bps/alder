@@ -47,6 +47,9 @@ pub enum PlannedAction {
     Trash {
         terminal: bool,
     },
+    ScanAppSupportingFiles {
+        terminal: bool,
+    },
 }
 
 pub fn plan_for_file(
@@ -72,7 +75,16 @@ pub fn plan_for_file(
                 });
 
                 if plan.is_none() {
-                    plan = Some(build_plan(config, rule, &source, &string_facts)?);
+                    match build_plan(config, rule, &source, &string_facts) {
+                        Ok(candidate) => plan = Some(candidate),
+                        Err(PlanError::UnsupportedActionForAppBundle(_)) => {
+                            // App bundles are first-class candidates only for
+                            // app-support scans. Keep generic regular-file rules
+                            // from turning an encountered `.app` into a pipeline
+                            // error, and allow a later app-specific rule to plan.
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
             }
             Ok(false) => rule_evaluations.push(RuleEvaluation {
@@ -109,7 +121,7 @@ fn build_plan(
     let extraction = render::extract_variables_with_diagnostics(&rule.extract, string_facts)?;
     let template_values = template_values(string_facts, &extraction.variables);
     let actions = match rule.actions.first() {
-        Some(action) => vec![plan_action(config, action, &template_values)?],
+        Some(action) => vec![plan_action(config, action, &template_values, string_facts)?],
         None => Vec::new(),
     };
 
@@ -127,7 +139,16 @@ fn plan_action(
     config: &Config,
     action: &Action,
     template_values: &IndexMap<String, String>,
+    string_facts: &FactStrings,
 ) -> Result<PlannedAction, PlanError> {
+    if string_facts
+        .get("file.kind")
+        .is_some_and(|kind| kind == "app_bundle")
+        && !matches!(action, Action::ScanAppSupportingFiles(_))
+    {
+        return Err(PlanError::UnsupportedActionForAppBundle(action.kind_name()));
+    }
+
     match action {
         Action::Move(action) => Ok(PlannedAction::Move {
             to: render::render_destination_path(&action.to, template_values)?,
@@ -135,6 +156,9 @@ fn plan_action(
             terminal: true,
         }),
         Action::Trash(_) => Ok(PlannedAction::Trash { terminal: true }),
+        Action::ScanAppSupportingFiles(_) => {
+            Ok(PlannedAction::ScanAppSupportingFiles { terminal: true })
+        }
         other => Err(PlanError::UnsupportedAction(other.kind_name())),
     }
 }
@@ -157,6 +181,7 @@ fn string_facts(facts: &IndexMap<String, Value>) -> FactStrings {
         .filter_map(|(key, value)| match value {
             Value::String(value) => Some((key.clone(), value.clone())),
             Value::Bool(value) => Some((key.clone(), value.to_string())),
+            Value::Number(value) => Some((key.clone(), value.to_string())),
             Value::Null => None,
         })
         .collect()
@@ -188,6 +213,8 @@ pub enum PlanError {
     Render(#[from] render::RenderError),
     #[error("action {0:?} is not supported by planning yet")]
     UnsupportedAction(&'static str),
+    #[error("action {0:?} is not supported for app bundle sources")]
+    UnsupportedActionForAppBundle(&'static str),
 }
 
 #[cfg(test)]
@@ -351,6 +378,75 @@ rules:
             explanation.plan.unwrap().actions[0],
             PlannedAction::Trash { terminal: true }
         );
+    }
+
+    #[test]
+    fn plans_scan_app_supporting_files_action() {
+        let config = parse_config_str(
+            r#"
+version: 1
+rules:
+  - id: removed-apps
+    when: file.ext == ".app"
+    actions:
+      - scan_app_supporting_files:
+"#,
+        )
+        .unwrap();
+        let facts = facts([("file.ext", ".app"), ("file.kind", "app_bundle")]);
+
+        let explanation = plan_for_file(&config, "/Applications/Example.app", &facts).unwrap();
+
+        assert_eq!(
+            explanation.plan.unwrap().actions[0],
+            PlannedAction::ScanAppSupportingFiles { terminal: true }
+        );
+    }
+
+    #[test]
+    fn app_bundles_skip_regular_file_actions_without_erroring() {
+        let config = parse_config_str(
+            r#"
+version: 1
+rules:
+  - id: generic
+    when: "true"
+    actions:
+      - trash:
+"#,
+        )
+        .unwrap();
+        let facts = facts([("file.kind", "app_bundle")]);
+
+        let explanation = plan_for_file(&config, "/Applications/Example.app", &facts).unwrap();
+
+        assert!(explanation.plan.is_none());
+        assert_eq!(explanation.rule_evaluations[0].error, None);
+    }
+
+    #[test]
+    fn app_bundles_can_fall_through_to_later_scan_rule() {
+        let config = parse_config_str(
+            r#"
+version: 1
+rules:
+  - id: generic
+    when: "true"
+    actions:
+      - trash:
+  - id: app-scan
+    when: "true"
+    actions:
+      - scan_app_supporting_files:
+"#,
+        )
+        .unwrap();
+        let facts = facts([("file.kind", "app_bundle")]);
+
+        let explanation = plan_for_file(&config, "/Applications/Example.app", &facts).unwrap();
+
+        assert_eq!(explanation.plan.unwrap().rule_id, "app-scan");
+        assert!(!explanation.rule_evaluations[1].shadowed);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use thiserror::Error;
 
-use crate::config::{DateExtractor, DateScope, DateWindow, Extractor, RegexExtractor};
+use crate::config::{DateExtractor, DateScope, DateSelect, DateWindow, Extractor, RegexExtractor};
 
 pub type FactStrings = IndexMap<String, String>;
 
@@ -173,11 +173,14 @@ fn extract_date_variable(
         return select_unique_date(
             name,
             extractor,
-            None,
-            None,
-            Some("document".to_string()),
-            candidates,
-            rejected,
+            DateSelection {
+                label: None,
+                matched_label: None,
+                window: Some("document".to_string()),
+                candidates,
+                rejected,
+                select: effective_select(extractor),
+            },
         );
     }
 
@@ -213,7 +216,8 @@ fn extract_date_variable(
         }
         let window_name = window.name();
         if extractor.after.is_some() {
-            let selected = select_after_candidate(&candidates);
+            let selected =
+                select_candidate(name, extractor, &candidates, effective_select(extractor))?;
             if let Some(extraction) = &mut extraction {
                 add_conflict_if_needed(extraction, matched.as_str(), &selected);
             } else {
@@ -233,19 +237,26 @@ fn extract_date_variable(
         } else {
             match extraction.as_mut() {
                 Some(extraction) => {
-                    if let Some(selected) = select_unique_candidate(&candidates) {
-                        add_conflict_if_needed(extraction, matched.as_str(), &selected);
-                    }
+                    let selected = select_candidate(
+                        name,
+                        extractor,
+                        &candidates,
+                        effective_select(extractor),
+                    )?;
+                    add_conflict_if_needed(extraction, matched.as_str(), &selected);
                 }
                 None => {
                     extraction = Some(select_unique_date(
                         name,
                         extractor,
-                        Some(label.clone()),
-                        Some(matched.as_str().to_string()),
-                        Some(window_name),
-                        candidates,
-                        rejected,
+                        DateSelection {
+                            label: Some(label.clone()),
+                            matched_label: Some(matched.as_str().to_string()),
+                            window: Some(window_name),
+                            candidates,
+                            rejected,
+                            select: effective_select(extractor),
+                        },
                     )?);
                 }
             }
@@ -271,16 +282,56 @@ fn extract_date_variable(
     })
 }
 
-fn select_after_candidate(candidates: &[ParsedCandidate]) -> ParsedCandidate {
-    candidates
-        .iter()
-        .min_by_key(|candidate| candidate.start)
-        .expect("candidates is not empty")
-        .clone()
+fn effective_select(extractor: &DateExtractor) -> DateSelect {
+    extractor.select.unwrap_or_else(|| {
+        if extractor.after.is_some() {
+            DateSelect::First
+        } else {
+            DateSelect::Unique
+        }
+    })
 }
 
-fn select_unique_candidate(candidates: &[ParsedCandidate]) -> Option<ParsedCandidate> {
-    unique_candidate_date(candidates).map(|_| candidates[0].clone())
+fn select_candidate(
+    name: &str,
+    extractor: &DateExtractor,
+    candidates: &[ParsedCandidate],
+    select: DateSelect,
+) -> Result<ParsedCandidate, RenderError> {
+    match select {
+        DateSelect::First => candidates
+            .iter()
+            .min_by_key(|candidate| candidate.start)
+            .cloned()
+            .ok_or_else(|| RenderError::NoMatch {
+                variable: name.to_string(),
+                fact: extractor.from.clone(),
+            }),
+        DateSelect::Last => candidates
+            .iter()
+            .max_by_key(|candidate| candidate.start)
+            .cloned()
+            .ok_or_else(|| RenderError::NoMatch {
+                variable: name.to_string(),
+                fact: extractor.from.clone(),
+            }),
+        DateSelect::Unique => {
+            if unique_candidate_date(candidates).is_none() {
+                return Err(RenderError::DateAmbiguous {
+                    variable: name.to_string(),
+                    fact: extractor.from.clone(),
+                    details: candidate_details(candidates),
+                });
+            }
+            candidates
+                .first()
+                .cloned()
+                .ok_or_else(|| RenderError::NoMatch {
+                    variable: name.to_string(),
+                    fact: extractor.from.clone(),
+                })
+        }
+    }
 }
 
 fn unique_candidate_date(candidates: &[ParsedCandidate]) -> Option<NaiveDate> {
@@ -309,17 +360,22 @@ fn add_conflict_if_needed(
     }
 }
 
-fn select_unique_date(
-    name: &str,
-    extractor: &DateExtractor,
+struct DateSelection {
     label: Option<String>,
     matched_label: Option<String>,
     window: Option<String>,
     candidates: Vec<ParsedCandidate>,
     rejected: Vec<RejectedCandidate>,
+    select: DateSelect,
+}
+
+fn select_unique_date(
+    name: &str,
+    extractor: &DateExtractor,
+    selection: DateSelection,
 ) -> Result<DateExtraction, RenderError> {
-    if candidates.is_empty() {
-        if let Some(rejected) = rejected.first() {
+    if selection.candidates.is_empty() {
+        if let Some(rejected) = selection.rejected.first() {
             return Err(rejected_candidate_error(name, extractor, rejected));
         }
         return Err(RenderError::NoMatch {
@@ -328,32 +384,27 @@ fn select_unique_date(
         });
     }
 
-    if unique_candidate_date(&candidates).is_none() {
-        let details = candidates
-            .iter()
-            .map(|candidate| format!("{} -> {}", candidate.text, iso_date(candidate.date)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(RenderError::DateAmbiguous {
-            variable: name.to_string(),
-            fact: extractor.from.clone(),
-            details,
-        });
-    }
-
-    let selected = candidates[0].clone();
+    let selected = select_candidate(name, extractor, &selection.candidates, selection.select)?;
     Ok(DateExtraction {
         value: iso_date(selected.date),
         diagnostic: diagnostic(
             name,
             extractor,
-            label,
-            matched_label,
-            window,
+            selection.label,
+            selection.matched_label,
+            selection.window,
             Some(selected),
-            rejected,
+            selection.rejected,
         ),
     })
+}
+
+fn candidate_details(candidates: &[ParsedCandidate]) -> String {
+    candidates
+        .iter()
+        .map(|candidate| format!("{} -> {}", candidate.text, iso_date(candidate.date)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn rejected_candidate_error(
@@ -574,11 +625,11 @@ fn candidate_regex(formats: &[String]) -> Regex {
     let mut pieces = Vec::new();
     if formats.iter().any(|format| {
         format.contains('/')
-            && format.contains("%Y")
+            && (format.contains("%Y") || format.contains("%y"))
             && (format.contains("%m") || format.contains("%-m"))
             && (format.contains("%d") || format.contains("%-d"))
     }) {
-        pieces.push(r"\d{1,2}/\d{1,2}/\d{4}");
+        pieces.push(r"\d{1,2}/\d{1,2}/\d{2,4}");
     }
     if formats.iter().any(|format| {
         format.contains('-')
@@ -592,7 +643,7 @@ fn candidate_regex(formats: &[String]) -> Regex {
         .iter()
         .any(|format| format.contains("%B") || format.contains("%b"))
     {
-        pieces.push(r"[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}");
+        pieces.push(r"[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4}");
     }
     if formats.iter().any(|format| format == "%Y%m%d") {
         pieces.push(r"\d{8}");
@@ -614,6 +665,11 @@ fn parse_candidate(value: &str, formats: &[String]) -> Result<NaiveDate, String>
     let mut parsed = Vec::new();
     let mut errors = Vec::new();
     for format in formats {
+        if slash_year_width(value).is_some_and(|width| {
+            (width == 2 && format.contains("%Y")) || (width == 4 && format.contains("%y"))
+        }) {
+            continue;
+        }
         match NaiveDate::parse_from_str(value, format) {
             Ok(date) => {
                 if !parsed.contains(&date) {
@@ -635,6 +691,14 @@ fn parse_candidate(value: &str, formats: &[String]) -> Result<NaiveDate, String>
                 .join(", ")
         )),
     }
+}
+
+fn slash_year_width(value: &str) -> Option<usize> {
+    let mut parts = value.split('/');
+    parts.next()?;
+    parts.next()?;
+    let year = parts.next()?;
+    parts.next().is_none().then_some(year.len())
 }
 
 fn dedupe_candidates(candidates: Vec<ParsedCandidate>) -> Vec<ParsedCandidate> {
@@ -1014,6 +1078,7 @@ mod tests {
                 near: None,
                 scope: None,
                 window: None,
+                select: None,
                 formats: vec!["%m/%d/%Y".to_string()],
                 min_year: None,
                 max_year: None,
@@ -1040,6 +1105,7 @@ mod tests {
                 near: None,
                 scope: None,
                 window: None,
+                select: None,
                 formats: vec!["%m/%d/%Y".to_string()],
                 min_year: None,
                 max_year: None,
@@ -1062,6 +1128,7 @@ mod tests {
                 near: None,
                 scope: None,
                 window: Some(DateWindow::SameLine),
+                select: None,
                 formats: vec!["%m/%d/%Y".to_string()],
                 min_year: None,
                 max_year: None,
@@ -1098,6 +1165,7 @@ mod tests {
                 near: None,
                 scope: None,
                 window: Some(DateWindow::SameLine),
+                select: None,
                 formats: vec!["%m/%d/%Y".to_string()],
                 min_year: None,
                 max_year: None,
@@ -1127,6 +1195,7 @@ mod tests {
                 near: Some("Bill Date".to_string()),
                 scope: None,
                 window: None,
+                select: None,
                 formats: vec!["%B %-d, %Y".to_string(), "%b %-d, %Y".to_string()],
                 min_year: None,
                 max_year: None,
@@ -1149,6 +1218,7 @@ mod tests {
                 near: Some("Bill Date".to_string()),
                 scope: None,
                 window: None,
+                select: None,
                 formats: vec!["%B %-d, %Y".to_string()],
                 min_year: None,
                 max_year: None,
@@ -1181,6 +1251,7 @@ mod tests {
                 near: None,
                 scope: Some(DateScope::Document),
                 window: None,
+                select: None,
                 formats: vec!["%Y-%m-%d".to_string()],
                 min_year: None,
                 max_year: None,
@@ -1203,6 +1274,7 @@ mod tests {
                 near: None,
                 scope: None,
                 window: Some(DateWindow::Paragraph),
+                select: None,
                 formats: vec!["%Y-%m-%d".to_string()],
                 min_year: None,
                 max_year: None,
@@ -1228,6 +1300,7 @@ mod tests {
                 near: None,
                 scope: None,
                 window: None,
+                select: None,
                 formats: vec!["%m/%d/%Y".to_string(), "%d/%m/%Y".to_string()],
                 min_year: None,
                 max_year: None,
@@ -1250,6 +1323,7 @@ mod tests {
                 near: None,
                 scope: None,
                 window: Some(DateWindow::SameLine),
+                select: None,
                 formats: vec!["%Y%m%d".to_string()],
                 min_year: None,
                 max_year: None,
@@ -1263,6 +1337,60 @@ mod tests {
     }
 
     #[test]
+    fn date_extractor_can_select_last_date_in_a_labeled_range() {
+        let extractors = extractors([date_extractor(
+            "stmt_date",
+            DateExtractor {
+                from: "pdf.text".to_string(),
+                after: None,
+                near: Some("days in Billing Cycle".to_string()),
+                scope: None,
+                window: Some(DateWindow::SameLine),
+                select: Some(DateSelect::Last),
+                formats: vec!["%b %-d, %Y".to_string()],
+                min_year: None,
+                max_year: None,
+            },
+        )]);
+        let facts = fact_strings([(
+            "pdf.text",
+            "Feb 10, 2026 - Mar 12, 2026 | 31 days in Billing Cycle",
+        )]);
+
+        let result = extract_variables_with_reference_year(&extractors, &facts, 2026).unwrap();
+
+        assert_eq!(result.variables["stmt_date"], "2026-03-12");
+    }
+
+    #[test]
+    fn date_extractor_accepts_two_digit_year_and_month_period_candidates() {
+        let extractors = extractors([date_extractor(
+            "bill_date",
+            DateExtractor {
+                from: "pdf.text".to_string(),
+                after: Some("Billing Date".to_string()),
+                near: None,
+                scope: None,
+                window: Some(DateWindow::SameLine),
+                select: None,
+                formats: vec!["%m/%d/%y".to_string(), "%b. %-d, %Y".to_string()],
+                min_year: None,
+                max_year: None,
+            },
+        )]);
+        let facts = fact_strings([("pdf.text", "Billing Date: 04/13/26")]);
+
+        let result = extract_variables_with_reference_year(&extractors, &facts, 2026).unwrap();
+
+        assert_eq!(result.variables["bill_date"], "2026-04-13");
+
+        let facts = fact_strings([("pdf.text", "Billing Date: Apr. 13, 2026")]);
+        let result = extract_variables_with_reference_year(&extractors, &facts, 2026).unwrap();
+
+        assert_eq!(result.variables["bill_date"], "2026-04-13");
+    }
+
+    #[test]
     fn invalid_calendar_date_and_year_range_error() {
         let extractors = extractors([date_extractor(
             "statement_date",
@@ -1272,6 +1400,7 @@ mod tests {
                 near: None,
                 scope: None,
                 window: None,
+                select: None,
                 formats: vec!["%m/%d/%Y".to_string()],
                 min_year: Some(2020),
                 max_year: Some(2025),
@@ -1297,6 +1426,7 @@ mod tests {
                     near: None,
                     scope: None,
                     window: None,
+                    select: None,
                     formats: vec!["%m/%d/%Y".to_string()],
                     min_year: None,
                     max_year: None,
@@ -1310,6 +1440,7 @@ mod tests {
                     near: None,
                     scope: None,
                     window: None,
+                    select: None,
                     formats: vec!["%m/%d/%Y".to_string()],
                     min_year: None,
                     max_year: None,

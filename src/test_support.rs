@@ -32,6 +32,18 @@ impl IntoFactValue for bool {
     }
 }
 
+impl IntoFactValue for i64 {
+    fn into_fact_value(self) -> Value {
+        Value::Number(self)
+    }
+}
+
+impl IntoFactValue for u64 {
+    fn into_fact_value(self) -> Value {
+        Value::Number(self.try_into().expect("fact value fits in i64"))
+    }
+}
+
 pub fn facts<V, const N: usize>(items: [(&str, V); N]) -> IndexMap<String, Value>
 where
     V: IntoFactValue,

@@ -1,8 +1,11 @@
 use indexmap::IndexMap;
 use regex::Regex;
 use serde::Serialize;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{iter::Peekable, str::CharIndices};
 use thiserror::Error;
+
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, TimeZone, Weekday};
 
 /// Provisional CEL-like evaluator for the MVP.
 ///
@@ -13,17 +16,45 @@ use thiserror::Error;
 pub enum Value {
     Null,
     Bool(bool),
+    Number(i64),
     String(String),
 }
 
 pub fn eval_bool(expr: &str, facts: &IndexMap<String, Value>) -> Result<bool, ExprError> {
+    eval_bool_with_context(expr, facts, EvalContext::default())
+}
+
+pub fn eval_bool_with_context(
+    expr: &str,
+    facts: &IndexMap<String, Value>,
+    context: EvalContext,
+) -> Result<bool, ExprError> {
     let ast = parse(expr)?;
-    match ast.eval(facts)? {
+    match ast.eval(facts, context)? {
         Value::Bool(value) => Ok(value),
         other => Err(ExprError::TypeError(format!(
             "expression produced {}, expected bool",
             other.type_name()
         ))),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EvalContext {
+    now: SystemTime,
+}
+
+impl EvalContext {
+    pub fn at(now: SystemTime) -> Self {
+        Self { now }
+    }
+}
+
+impl Default for EvalContext {
+    fn default() -> Self {
+        Self {
+            now: SystemTime::now(),
+        }
     }
 }
 
@@ -76,29 +107,37 @@ impl Expr {
         }
     }
 
-    fn eval(&self, facts: &IndexMap<String, Value>) -> Result<Value, ExprError> {
+    fn eval(
+        &self,
+        facts: &IndexMap<String, Value>,
+        context: EvalContext,
+    ) -> Result<Value, ExprError> {
         match self {
             Self::Literal(value) => Ok(value.clone()),
             Self::Identifier(name) => facts
                 .get(name)
                 .cloned()
                 .ok_or_else(|| ExprError::UnknownIdentifier(name.clone())),
-            Self::Call { name, args } => eval_call(name, args, facts),
+            Self::Call { name, args } => eval_call(name, args, facts, context),
             Self::Binary { op, left, right } => match op {
                 BinaryOp::And => {
-                    if !expect_bool(left.eval(facts)?)? {
+                    if !expect_bool(left.eval(facts, context)?)? {
                         return Ok(Value::Bool(false));
                     }
-                    Ok(Value::Bool(expect_bool(right.eval(facts)?)?))
+                    Ok(Value::Bool(expect_bool(right.eval(facts, context)?)?))
                 }
                 BinaryOp::Or => {
-                    if expect_bool(left.eval(facts)?)? {
+                    if expect_bool(left.eval(facts, context)?)? {
                         return Ok(Value::Bool(true));
                     }
-                    Ok(Value::Bool(expect_bool(right.eval(facts)?)?))
+                    Ok(Value::Bool(expect_bool(right.eval(facts, context)?)?))
                 }
-                BinaryOp::Eq => Ok(Value::Bool(left.eval(facts)? == right.eval(facts)?)),
-                BinaryOp::Ne => Ok(Value::Bool(left.eval(facts)? != right.eval(facts)?)),
+                BinaryOp::Eq => Ok(Value::Bool(
+                    left.eval(facts, context)? == right.eval(facts, context)?,
+                )),
+                BinaryOp::Ne => Ok(Value::Bool(
+                    left.eval(facts, context)? != right.eval(facts, context)?,
+                )),
             },
         }
     }
@@ -116,18 +155,19 @@ fn eval_call(
     name: &str,
     args: &[Expr],
     facts: &IndexMap<String, Value>,
+    context: EvalContext,
 ) -> Result<Value, ExprError> {
     match name {
         "contains" => {
             expect_arity(name, args, 2)?;
-            let haystack = args[0].eval(facts)?;
-            let needle = expect_string(args[1].eval(facts)?)?;
+            let haystack = args[0].eval(facts, context)?;
+            let needle = expect_string(args[1].eval(facts, context)?)?;
             eval_nullable_string_predicate(name, haystack, |haystack| haystack.contains(&needle))
         }
         "matches" => {
             expect_arity(name, args, 2)?;
-            let haystack = args[0].eval(facts)?;
-            let pattern = expect_string(args[1].eval(facts)?)?;
+            let haystack = args[0].eval(facts, context)?;
+            let pattern = expect_string(args[1].eval(facts, context)?)?;
             let regex = Regex::new(&pattern).map_err(|error| ExprError::BadRegex {
                 pattern,
                 message: error.to_string(),
@@ -136,7 +176,7 @@ fn eval_call(
         }
         "lower" => {
             expect_arity(name, args, 1)?;
-            Ok(match args[0].eval(facts)? {
+            Ok(match args[0].eval(facts, context)? {
                 Value::String(value) => Value::String(value.to_lowercase()),
                 Value::Null => Value::Null,
                 other => {
@@ -146,6 +186,24 @@ fn eval_call(
                     )));
                 }
             })
+        }
+        "older_than" => {
+            expect_arity(name, args, 2)?;
+            let timestamp = expect_unix_seconds(args[0].eval(facts, context)?)?;
+            let duration = parse_duration(&expect_string(args[1].eval(facts, context)?)?)?;
+            let threshold = context.now.checked_sub(duration).ok_or_else(|| {
+                ExprError::Time("duration moves comparison before supported time range".to_string())
+            })?;
+            let timestamp = system_time_from_unix_seconds(timestamp)?;
+            Ok(Value::Bool(timestamp < threshold))
+        }
+        "before_start_of_week" => {
+            expect_arity(name, args, 2)?;
+            let timestamp = expect_unix_seconds(args[0].eval(facts, context)?)?;
+            let week_start = parse_weekday(&expect_string(args[1].eval(facts, context)?)?)?;
+            let boundary = start_of_week(context.now, week_start)?;
+            let timestamp = system_time_from_unix_seconds(timestamp)?;
+            Ok(Value::Bool(timestamp < boundary))
         }
         _ => Err(ExprError::UnknownFunction(name.to_string())),
     }
@@ -200,11 +258,100 @@ fn expect_string(value: Value) -> Result<String, ExprError> {
     }
 }
 
+fn expect_unix_seconds(value: Value) -> Result<i64, ExprError> {
+    match value {
+        Value::Number(value) => Ok(value),
+        Value::String(value) => value.parse::<i64>().map_err(|error| {
+            ExprError::Time(format!(
+                "expected Unix seconds timestamp, got {value:?}: {error}"
+            ))
+        }),
+        other => Err(ExprError::TypeError(format!(
+            "timestamp argument must be number or string, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn parse_duration(value: &str) -> Result<Duration, ExprError> {
+    let value = value.trim();
+    let (amount, unit) = value.split_at(
+        value
+            .find(|ch: char| !ch.is_ascii_digit())
+            .ok_or_else(|| ExprError::Time(format!("duration {value:?} is missing a unit")))?,
+    );
+    if amount.is_empty() || unit.is_empty() || unit.chars().any(|ch| ch.is_ascii_digit()) {
+        return Err(ExprError::Time(format!(
+            "duration {value:?} must look like 2d, 12h, 30m, or 60s"
+        )));
+    }
+    let amount = amount
+        .parse::<u64>()
+        .map_err(|error| ExprError::Time(format!("invalid duration {value:?}: {error}")))?;
+    let seconds = match unit {
+        "s" => Some(amount),
+        "m" => amount.checked_mul(60),
+        "h" => amount.checked_mul(60 * 60),
+        "d" => amount.checked_mul(24 * 60 * 60),
+        "w" => amount.checked_mul(7 * 24 * 60 * 60),
+        _ => {
+            return Err(ExprError::Time(format!(
+                "unsupported duration unit {unit:?}; expected s, m, h, d, or w"
+            )));
+        }
+    }
+    .ok_or_else(|| ExprError::Time(format!("duration {value:?} is too large")))?;
+    Ok(Duration::from_secs(seconds))
+}
+
+fn parse_weekday(value: &str) -> Result<Weekday, ExprError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "sun" | "sunday" => Ok(Weekday::Sun),
+        "mon" | "monday" => Ok(Weekday::Mon),
+        "tue" | "tues" | "tuesday" => Ok(Weekday::Tue),
+        "wed" | "wednesday" => Ok(Weekday::Wed),
+        "thu" | "thur" | "thurs" | "thursday" => Ok(Weekday::Thu),
+        "fri" | "friday" => Ok(Weekday::Fri),
+        "sat" | "saturday" => Ok(Weekday::Sat),
+        _ => Err(ExprError::Time(format!(
+            "unsupported week start {value:?}; expected sunday, monday, ..."
+        ))),
+    }
+}
+
+fn system_time_from_unix_seconds(seconds: i64) -> Result<SystemTime, ExprError> {
+    if seconds < 0 {
+        return Err(ExprError::Time(format!(
+            "negative Unix timestamps are not supported: {seconds}"
+        )));
+    }
+    Ok(UNIX_EPOCH + Duration::from_secs(seconds as u64))
+}
+
+fn start_of_week(now: SystemTime, week_start: Weekday) -> Result<SystemTime, ExprError> {
+    let now: DateTime<Local> = DateTime::from(now);
+    let days_since_start =
+        (now.weekday().num_days_from_sunday() + 7 - week_start.num_days_from_sunday()) % 7;
+    let start_date = now.date_naive() - ChronoDuration::days(days_since_start.into());
+    let local_midnight = start_date
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid time");
+    let start = Local
+        .from_local_datetime(&local_midnight)
+        .earliest()
+        .or_else(|| Local.from_local_datetime(&local_midnight).latest())
+        .ok_or_else(|| {
+            ExprError::Time("failed to resolve local start-of-week boundary".to_string())
+        })?;
+    Ok(start.into())
+}
+
 impl Value {
     fn type_name(&self) -> &'static str {
         match self {
             Self::Null => "null",
             Self::Bool(_) => "bool",
+            Self::Number(_) => "number",
             Self::String(_) => "string",
         }
     }
@@ -228,6 +375,8 @@ pub enum ExprError {
     TypeError(String),
     #[error("bad regex {pattern:?}: {message}")]
     BadRegex { pattern: String, message: String },
+    #[error("time error: {0}")]
+    Time(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -658,6 +807,76 @@ mod tests {
         let error = eval_bool("starts_with(pdf.text, \"t\")", &facts).unwrap_err();
 
         assert_eq!(error, ExprError::UnknownFunction("starts_with".to_string()));
+    }
+
+    #[test]
+    fn evaluates_older_than_with_durations() {
+        let now = UNIX_EPOCH + Duration::from_secs(10 * 24 * 60 * 60);
+        let facts = facts([("file.created_at_unix", 7 * 24 * 60 * 60_i64)]);
+
+        assert!(
+            eval_bool_with_context(
+                r#"older_than(file.created_at_unix, "2d")"#,
+                &facts,
+                EvalContext::at(now),
+            )
+            .unwrap()
+        );
+        assert!(
+            !eval_bool_with_context(
+                r#"older_than(file.created_at_unix, "4d")"#,
+                &facts,
+                EvalContext::at(now),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn evaluates_before_start_of_week_with_explicit_week_start() {
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 13, 12, 0, 0)
+            .single()
+            .unwrap();
+        let previous_saturday = Local
+            .with_ymd_and_hms(2026, 5, 9, 23, 59, 59)
+            .single()
+            .unwrap();
+        let sunday = Local
+            .with_ymd_and_hms(2026, 5, 10, 0, 0, 0)
+            .single()
+            .unwrap();
+        let facts = facts([
+            ("previous_saturday", previous_saturday.timestamp()),
+            ("sunday", sunday.timestamp()),
+        ]);
+
+        assert!(
+            eval_bool_with_context(
+                r#"before_start_of_week(previous_saturday, "sunday")"#,
+                &facts,
+                EvalContext::at(now.into()),
+            )
+            .unwrap()
+        );
+        assert!(
+            !eval_bool_with_context(
+                r#"before_start_of_week(sunday, "sunday")"#,
+                &facts,
+                EvalContext::at(now.into()),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn time_functions_report_bad_inputs() {
+        let facts = facts([("file.created_at_unix", 123_i64)]);
+
+        let error =
+            eval_bool(r#"older_than(file.created_at_unix, "two days")"#, &facts).unwrap_err();
+
+        assert!(matches!(error, ExprError::Time(_)));
     }
 
     #[test]

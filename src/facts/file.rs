@@ -13,6 +13,7 @@ pub struct FileFacts {
     name: String,
     stem: String,
     ext: String,
+    kind: FileKind,
     size: u64,
     created_at: Option<SystemTime>,
     modified_at: Option<SystemTime>,
@@ -26,9 +27,13 @@ impl FileFacts {
         let metadata = fs::metadata(&path)
             .map_err(|error| FileFactError::io("read metadata", &path, error))?;
 
-        if !metadata.is_file() {
-            return Err(FileFactError::not_regular_file(&path));
-        }
+        let kind = if metadata.is_file() {
+            FileKind::RegularFile
+        } else if metadata.is_dir() && is_app_bundle_path(&path) {
+            FileKind::AppBundle
+        } else {
+            return Err(FileFactError::unsupported_file_type(&path));
+        };
 
         let name = path
             .file_name()
@@ -51,6 +56,7 @@ impl FileFacts {
             name,
             stem,
             ext,
+            kind,
             size: metadata.len(),
             created_at: metadata.created().ok(),
             modified_at: metadata.modified().ok(),
@@ -64,13 +70,22 @@ impl FileFacts {
             "file.name" => FileFactValue::String(self.name.clone()),
             "file.stem" => FileFactValue::String(self.stem.clone()),
             "file.ext" => FileFactValue::String(self.ext.clone()),
+            "file.kind" => FileFactValue::String(self.kind.as_str().to_string()),
             "file.size" => FileFactValue::Unsigned(self.size),
             "file.created_at" => match self.created_at {
                 Some(time) => FileFactValue::Time(time),
                 None => return Ok(None),
             },
+            "file.created_at_unix" => match self.created_at.and_then(unix_seconds) {
+                Some(seconds) => FileFactValue::Unsigned(seconds),
+                None => return Ok(None),
+            },
             "file.modified_at" => match self.modified_at {
                 Some(time) => FileFactValue::Time(time),
+                None => return Ok(None),
+            },
+            "file.modified_at_unix" => match self.modified_at.and_then(unix_seconds) {
+                Some(seconds) => FileFactValue::Unsigned(seconds),
                 None => return Ok(None),
             },
             "file.sha256" => FileFactValue::String(self.sha256()?.to_string()),
@@ -96,6 +111,14 @@ impl FileFacts {
         &self.ext
     }
 
+    pub fn kind(&self) -> FileKind {
+        self.kind
+    }
+
+    pub fn is_app_bundle(&self) -> bool {
+        self.kind == FileKind::AppBundle
+    }
+
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -117,6 +140,21 @@ impl FileFacts {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    RegularFile,
+    AppBundle,
+}
+
+impl FileKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RegularFile => "file",
+            Self::AppBundle => "app_bundle",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileFactValue {
     Path(PathBuf),
@@ -134,8 +172,8 @@ pub enum FileFactError {
         kind: io::ErrorKind,
         message: String,
     },
-    #[error("{} is not a regular file", path.display())]
-    NotRegularFile { path: PathBuf },
+    #[error("{} is not a regular file or app bundle", path.display())]
+    UnsupportedFileType { path: PathBuf },
 }
 
 impl FileFactError {
@@ -148,11 +186,17 @@ impl FileFactError {
         }
     }
 
-    fn not_regular_file(path: impl AsRef<Path>) -> Self {
-        Self::NotRegularFile {
+    fn unsupported_file_type(path: impl AsRef<Path>) -> Self {
+        Self::UnsupportedFileType {
             path: path.as_ref().to_path_buf(),
         }
     }
+}
+
+fn is_app_bundle_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
 }
 
 fn sha256_file(path: &Path) -> Result<String, FileFactError> {
@@ -173,6 +217,12 @@ fn sha256_file(path: &Path) -> Result<String, FileFactError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn unix_seconds(time: SystemTime) -> Option<u64> {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +239,7 @@ mod tests {
         assert_eq!(facts.name(), "Statement.PDF");
         assert_eq!(facts.stem(), "Statement");
         assert_eq!(facts.ext(), ".PDF");
+        assert_eq!(facts.kind(), FileKind::RegularFile);
         assert_eq!(facts.size(), 3);
         assert!(facts.modified_at().is_some());
         assert_eq!(
@@ -214,9 +265,21 @@ mod tests {
             Some(FileFactValue::String(".pdf".to_string()))
         );
         assert_eq!(
+            facts.get("file.kind").unwrap(),
+            Some(FileFactValue::String("file".to_string()))
+        );
+        assert_eq!(
             facts.get("file.size").unwrap(),
             Some(FileFactValue::Unsigned(3))
         );
+        assert!(matches!(
+            facts.get("file.created_at_unix").unwrap(),
+            Some(FileFactValue::Unsigned(_))
+        ));
+        assert!(matches!(
+            facts.get("file.modified_at_unix").unwrap(),
+            Some(FileFactValue::Unsigned(_))
+        ));
         assert_eq!(facts.get("pdf.text").unwrap(), None);
     }
 
@@ -232,12 +295,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_directories() {
+    fn rejects_non_app_directories() {
         let temp_dir = tempfile::tempdir().unwrap();
 
         let error = FileFacts::from_path(temp_dir.path()).unwrap_err();
 
-        assert!(matches!(error, FileFactError::NotRegularFile { .. }));
+        assert!(matches!(error, FileFactError::UnsupportedFileType { .. }));
+    }
+
+    #[test]
+    fn produces_file_facts_for_app_bundles() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let app = temp_dir.path().join("Example.app");
+        fs::create_dir(&app).unwrap();
+
+        let facts = FileFacts::from_path(&app).unwrap();
+
+        assert_eq!(facts.name(), "Example.app");
+        assert_eq!(facts.stem(), "Example");
+        assert_eq!(facts.ext(), ".app");
+        assert_eq!(facts.kind(), FileKind::AppBundle);
+        assert!(facts.is_app_bundle());
+        assert_eq!(
+            facts.get("file.kind").unwrap(),
+            Some(FileFactValue::String("app_bundle".to_string()))
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::{env, fs, io};
@@ -24,7 +25,10 @@ const EXIT_NOT_IMPLEMENTED: u8 = 2;
 /// 1. An explicit `--config PATH`, if provided.
 /// 2. `./alder.yaml` in the current working directory.
 /// 3. `./alder.yml` in the current working directory.
-const DEFAULT_CONFIG_CANDIDATES: &[&str] = &["alder.yaml", "alder.yml"];
+/// 4. `$XDG_CONFIG_HOME/alder/alder.yaml`, then `.yml`.
+/// 5. `$HOME/.config/alder/alder.yaml`, then `.yml`, when XDG_CONFIG_HOME is unset,
+///    empty, or relative.
+const LOCAL_CONFIG_CANDIDATES: &[&str] = &["alder.yaml", "alder.yml"];
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Plaintext, agent-friendly file routing")]
@@ -145,7 +149,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         .config
         .as_ref()
         .map(|path| path.display().to_string())
-        .unwrap_or_else(|| DEFAULT_CONFIG_CANDIDATES.join(" then "));
+        .unwrap_or_else(default_config_hint);
 
     match cli.command {
         Command::Run(args) => run_paths(cli.config.as_deref(), cli.json, args.paths, args.dry_run),
@@ -231,6 +235,7 @@ fn process_candidates(
 
     let options = ProcessOptions {
         dry_run,
+        notifications: !dry_run,
         destination_roots: roots,
         action_log_path: default_action_log_path(),
         run_id: default_run_id(),
@@ -342,10 +347,10 @@ fn resolve_config_path(config_path: Option<&Path>) -> Result<PathBuf, String> {
             .map_err(|error| format!("failed to resolve config path {}: {error}", path.display()));
     }
 
-    for candidate in DEFAULT_CONFIG_CANDIDATES {
-        let path = PathBuf::from(candidate);
+    let candidates = default_config_candidates();
+    for path in &candidates {
         if path.exists() {
-            return std::path::absolute(&path).map_err(|error| {
+            return std::path::absolute(path).map_err(|error| {
                 format!("failed to resolve config path {}: {error}", path.display())
             });
         }
@@ -353,8 +358,51 @@ fn resolve_config_path(config_path: Option<&Path>) -> Result<PathBuf, String> {
 
     Err(format!(
         "no config path provided and none found: {}",
-        DEFAULT_CONFIG_CANDIDATES.join(", ")
+        candidates
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
+}
+
+fn default_config_candidates() -> Vec<PathBuf> {
+    LOCAL_CONFIG_CANDIDATES
+        .iter()
+        .map(PathBuf::from)
+        .chain(xdg_config_candidates(
+            env::var_os("HOME"),
+            env::var_os("XDG_CONFIG_HOME"),
+        ))
+        .collect()
+}
+
+fn default_config_hint() -> String {
+    default_config_candidates()
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" then ")
+}
+
+fn xdg_config_candidates(
+    home: Option<OsString>,
+    xdg_config_home: Option<OsString>,
+) -> Vec<PathBuf> {
+    let config_home = xdg_config_home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| home.map(PathBuf::from).map(|home| home.join(".config")));
+
+    let Some(config_home) = config_home else {
+        return Vec::new();
+    };
+
+    vec![
+        config_home.join("alder/alder.yaml"),
+        config_home.join("alder/alder.yml"),
+    ]
 }
 
 fn load_config(path: &Path) -> Result<alder::config::Config, String> {
@@ -463,6 +511,9 @@ fn print_human_result(result: &alder::pipeline::PipelineResult) {
                     "  Executed {}: {:?} ({reason})",
                     record.action, record.status
                 );
+                for supporting_file in &record.supporting_files {
+                    println!("    Candidate: {}", supporting_file.display());
+                }
             } else {
                 println!("  Executed {}: {:?}", record.action, record.status);
             }
@@ -535,6 +586,42 @@ mod tests {
             }
             other => panic!("expected run command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn xdg_candidates_prefer_absolute_xdg_config_home() {
+        let candidates = xdg_config_candidates(
+            Some(OsString::from("/home/alice")),
+            Some(OsString::from("/tmp/xdg")),
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/tmp/xdg/alder/alder.yaml"),
+                PathBuf::from("/tmp/xdg/alder/alder.yml"),
+            ]
+        );
+    }
+
+    #[test]
+    fn xdg_candidates_fall_back_to_home_for_empty_or_relative_xdg_config_home() {
+        for xdg in [OsString::new(), OsString::from("relative")] {
+            let candidates = xdg_config_candidates(Some(OsString::from("/home/alice")), Some(xdg));
+
+            assert_eq!(
+                candidates,
+                vec![
+                    PathBuf::from("/home/alice/.config/alder/alder.yaml"),
+                    PathBuf::from("/home/alice/.config/alder/alder.yml"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn xdg_candidates_are_empty_without_home_or_absolute_xdg_config_home() {
+        assert!(xdg_config_candidates(None, None).is_empty());
     }
 
     #[test]

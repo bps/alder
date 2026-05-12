@@ -192,6 +192,7 @@ pub struct DateExtractor {
     pub near: Option<String>,
     pub scope: Option<DateScope>,
     pub window: Option<DateWindow>,
+    pub select: Option<DateSelect>,
     pub formats: Vec<String>,
     pub min_year: Option<i32>,
     pub max_year: Option<i32>,
@@ -211,6 +212,8 @@ struct RawDateExtractor {
     scope: Option<DateScope>,
     #[serde(default)]
     window: Option<DateWindow>,
+    #[serde(default)]
+    select: Option<DateSelect>,
     formats: Vec<String>,
     #[serde(default)]
     min_year: Option<i32>,
@@ -227,6 +230,7 @@ impl From<RawDateExtractor> for DateExtractor {
             near,
             scope,
             window,
+            select,
             formats,
             min_year,
             max_year,
@@ -237,6 +241,7 @@ impl From<RawDateExtractor> for DateExtractor {
             near,
             scope,
             window,
+            select,
             formats,
             min_year,
             max_year,
@@ -254,6 +259,14 @@ enum DateExtractorKind {
 #[serde(rename_all = "snake_case")]
 pub enum DateScope {
     Document,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DateSelect {
+    First,
+    Last,
+    Unique,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,6 +319,7 @@ pub enum Action {
     Rename(DestinationAction),
     Tag(TagAction),
     Trash(#[serde(default)] TrashAction),
+    ScanAppSupportingFiles(#[serde(default)] ScanAppSupportingFilesAction),
     Review(#[serde(default)] ReviewAction),
     MoveToReview(#[serde(default)] MoveToReviewAction),
 }
@@ -318,6 +332,7 @@ impl Action {
             Action::Rename(_) => "rename",
             Action::Tag(_) => "tag",
             Action::Trash(_) => "trash",
+            Action::ScanAppSupportingFiles(_) => "scan_app_supporting_files",
             Action::Review(_) => "review",
             Action::MoveToReview(_) => "move_to_review",
         }
@@ -342,6 +357,10 @@ pub struct TagAction {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrashAction {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanAppSupportingFilesAction {}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -785,6 +804,7 @@ rules:
           to: ~/Documents/Review/{{ file.name }}
       - trash: {}
       - trash:
+      - scan_app_supporting_files:
       - tag:
           tags:
             - tax
@@ -793,7 +813,7 @@ rules:
         )
         .unwrap();
 
-        assert_eq!(config.rules[0].actions.len(), 7);
+        assert_eq!(config.rules[0].actions.len(), 8);
         match &config.rules[0].actions[0] {
             Action::Review(action) => assert_eq!(action, &ReviewAction::default()),
             other => panic!("expected review action, got {other:?}"),
@@ -828,6 +848,12 @@ rules:
             Action::Trash(action) => assert_eq!(action, &TrashAction::default()),
             other => panic!("expected trash action, got {other:?}"),
         }
-        assert!(matches!(config.rules[0].actions[6], Action::Tag(_)));
+        match &config.rules[0].actions[6] {
+            Action::ScanAppSupportingFiles(action) => {
+                assert_eq!(action, &ScanAppSupportingFilesAction::default());
+            }
+            other => panic!("expected scan_app_supporting_files action, got {other:?}"),
+        }
+        assert!(matches!(config.rules[0].actions[7], Action::Tag(_)));
     }
 }

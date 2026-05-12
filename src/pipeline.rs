@@ -6,16 +6,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use indexmap::IndexMap;
 use serde::Serialize;
 
-use crate::config::{Config, Rule};
+use crate::config::{Action, Config, Rule};
 use crate::execute::{ExecuteOptions, ExecutionReport, execute_plan};
 use crate::expr::{self, Value};
 use crate::facts::file::FileFacts;
+use crate::notify::notify_execution_records;
 use crate::path_utils::{PathError, expand_user_path};
 use crate::planning::{Explanation, plan_for_file};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProcessOptions {
     pub dry_run: bool,
+    pub notifications: bool,
     pub destination_roots: Vec<PathBuf>,
     pub action_log_path: PathBuf,
     pub run_id: String,
@@ -94,7 +96,10 @@ mod fact_providers {
     use crate::facts::pdf::PdfTextProvider;
     use crate::facts::spotlight::SpotlightProvider;
 
-    use super::{Applicability, RequiredFacts, spotlight_value_string, system_time_string};
+    use super::{
+        Applicability, RequiredFacts, spotlight_value_string, system_time_string,
+        system_time_unix_seconds,
+    };
 
     pub(super) trait FactProvider {
         fn name(&self) -> super::FactProvider;
@@ -136,6 +141,10 @@ mod fact_providers {
                 Value::String(file.ext().to_string()),
             );
             facts.insert(
+                "file.kind".to_string(),
+                Value::String(file.kind().as_str().to_string()),
+            );
+            facts.insert(
                 "file.size".to_string(),
                 Value::String(file.size().to_string()),
             );
@@ -144,11 +153,19 @@ mod fact_providers {
                     "file.modified_at".to_string(),
                     Value::String(system_time_string(modified)),
                 );
+                facts.insert(
+                    "file.modified_at_unix".to_string(),
+                    Value::Number(system_time_unix_seconds(modified)),
+                );
             }
             if let Some(created) = file.created_at() {
                 facts.insert(
                     "file.created_at".to_string(),
                     Value::String(system_time_string(created)),
+                );
+                facts.insert(
+                    "file.created_at_unix".to_string(),
+                    Value::Number(system_time_unix_seconds(created)),
                 );
             }
 
@@ -231,7 +248,7 @@ pub fn process_paths(
     paths: &[PathBuf],
     options: &ProcessOptions,
 ) -> Vec<PipelineResult> {
-    collect_input_paths(paths)
+    collect_input_paths(paths, config_includes_app_bundle_scan(config))
         .into_iter()
         .map(|path| process_file(config, path, options))
         .collect()
@@ -294,7 +311,10 @@ fn facts_for_file_with_required(path: impl AsRef<Path>, required: &RequiredFacts
                 let provider_name = provider.name();
                 match provider.applies(&file, required) {
                     Applicability::Required => match provider.collect(&file) {
-                        Ok(produced) => {
+                        Ok(mut produced) => {
+                            if provider_name == FactProvider::Spotlight {
+                                add_missing_spotlight_facts(&mut produced, required);
+                            }
                             let produced_keys = produced.keys().cloned().collect();
                             facts.extend(produced);
                             provider_reports.push(ProviderReport {
@@ -392,6 +412,12 @@ fn upsert_provider_report(reports: &mut Vec<ProviderReport>, report: ProviderRep
     }
 }
 
+fn add_missing_spotlight_facts(facts: &mut IndexMap<String, Value>, required: &RequiredFacts) {
+    for key in required.provider_keys("spotlight") {
+        facts.entry(key).or_insert(Value::Null);
+    }
+}
+
 pub fn destination_roots(config: &Config) -> Result<Vec<PathBuf>, String> {
     let roots = config
         .defaults
@@ -427,7 +453,12 @@ fn process_file(config: &Config, source: PathBuf, options: &ProcessOptions) -> P
             run_id: options.run_id.clone(),
         };
         match execute_plan(plan, &execute_options) {
-            Ok(report) => Some(report),
+            Ok(report) => {
+                if options.notifications {
+                    notify_execution_records(&report.records);
+                }
+                Some(report)
+            }
             Err(execute_error) => {
                 error = Some(execute_error.to_string());
                 None
@@ -447,24 +478,40 @@ fn process_file(config: &Config, source: PathBuf, options: &ProcessOptions) -> P
     }
 }
 
-fn collect_input_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+fn collect_input_paths(paths: &[PathBuf], include_app_bundles: bool) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for path in paths {
-        collect_path(path, &mut files);
+        collect_path(path, include_app_bundles, &mut files);
     }
     files.sort();
     files.dedup();
     files
 }
 
-fn collect_path(path: &Path, files: &mut Vec<PathBuf>) {
+fn is_app_bundle_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+}
+
+fn config_includes_app_bundle_scan(config: &Config) -> bool {
+    config.rules.iter().any(|rule| {
+        matches!(
+            rule.actions.first(),
+            Some(Action::ScanAppSupportingFiles(_))
+        )
+    })
+}
+
+fn collect_path(path: &Path, include_app_bundles: bool, files: &mut Vec<PathBuf>) {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return;
     };
     if metadata.file_type().is_symlink() {
         return;
     }
-    if metadata.is_file() {
+    if metadata.is_file() || (include_app_bundles && metadata.is_dir() && is_app_bundle_path(path))
+    {
         files.push(path.to_path_buf());
     } else if metadata.is_dir() {
         let Ok(entries) = fs::read_dir(path) else {
@@ -475,7 +522,7 @@ fn collect_path(path: &Path, files: &mut Vec<PathBuf>) {
             if name.to_string_lossy().starts_with('.') {
                 continue;
             }
-            collect_path(&entry.path(), files);
+            collect_path(&entry.path(), include_app_bundles, files);
         }
     }
 }
@@ -536,9 +583,13 @@ fn spotlight_value_string(value: &plist::Value) -> String {
 }
 
 fn system_time_string(time: SystemTime) -> String {
+    system_time_unix_seconds(time).to_string()
+}
+
+fn system_time_unix_seconds(time: SystemTime) -> i64 {
     match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_secs().to_string(),
-        Err(_) => "0".to_string(),
+        Ok(duration) => duration.as_secs().try_into().unwrap_or(i64::MAX),
+        Err(error) => -i64::try_from(error.duration().as_secs()).unwrap_or(i64::MAX),
     }
 }
 
@@ -579,6 +630,74 @@ mod tests {
         assert!(results[0].explanation.as_ref().unwrap().plan.is_some());
         assert!(source.exists());
         assert!(!sorted.join("statement.pdf").exists());
+    }
+
+    #[test]
+    fn app_bundles_are_leaf_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("Example.app");
+        fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        fs::write(app.join("Contents/MacOS/Example"), b"binary").unwrap();
+        let config = parse_config_str(
+            r#"
+version: 1
+rules:
+  - id: apps
+    when: file.ext == ".app" && file.kind == "app_bundle"
+    actions:
+      - scan_app_supporting_files:
+"#,
+        )
+        .unwrap();
+
+        let results = process_paths(
+            &config,
+            &[temp.path().to_path_buf()],
+            &options(true, temp.path()),
+        );
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, app);
+        assert!(matches!(
+            results[0]
+                .explanation
+                .as_ref()
+                .unwrap()
+                .plan
+                .as_ref()
+                .unwrap()
+                .actions[0],
+            crate::planning::PlannedAction::ScanAppSupportingFiles { .. }
+        ));
+    }
+
+    #[test]
+    fn app_bundles_are_recurred_without_scan_action() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("Example.app");
+        fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        let inner = app.join("Contents/MacOS/Example");
+        fs::write(&inner, b"binary").unwrap();
+        let config = parse_config_str(
+            r#"
+version: 1
+rules:
+  - id: binaries
+    when: file.name == "Example"
+    actions:
+      - trash:
+"#,
+        )
+        .unwrap();
+
+        let results = process_paths(
+            &config,
+            &[temp.path().to_path_buf()],
+            &options(true, temp.path()),
+        );
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, inner);
     }
 
     #[test]
@@ -765,6 +884,24 @@ rules:
     }
 
     #[test]
+    fn missing_spotlight_attributes_are_null_facts() {
+        let mut facts = IndexMap::new();
+        let required = RequiredFacts {
+            keys: [
+                "file.ext".to_string(),
+                "spotlight.kMDItemWhereFroms".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        add_missing_spotlight_facts(&mut facts, &required);
+
+        assert_eq!(facts.get("spotlight.kMDItemWhereFroms"), Some(&Value::Null));
+        assert!(!facts.contains_key("file.ext"));
+    }
+
+    #[test]
     fn file_fact_errors_do_not_report_other_providers() {
         let temp = tempfile::tempdir().unwrap();
         let config = config(temp.path());
@@ -801,6 +938,7 @@ rules:
     fn options(dry_run: bool, root: &Path) -> ProcessOptions {
         ProcessOptions {
             dry_run,
+            notifications: false,
             destination_roots: vec![root.to_path_buf()],
             action_log_path: root.parent().unwrap().join("actions.jsonl"),
             run_id: "test".to_string(),

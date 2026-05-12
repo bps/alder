@@ -1,7 +1,9 @@
+pub mod app_support;
 pub mod config;
 pub mod execute;
 pub mod expr;
 pub mod facts;
+pub mod notify;
 pub mod path_utils;
 pub mod pipeline;
 pub mod planning;

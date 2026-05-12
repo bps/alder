@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::app_support::scan_app_supporting_files;
 use crate::config::ConflictPolicy;
 use crate::facts::file::{FileFactError, FileFacts};
 use crate::path_utils::{PathError, expand_user_path};
@@ -40,6 +41,8 @@ pub struct ExecutionRecord {
     pub rule_id: String,
     pub sha256: Option<String>,
     pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supporting_files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +50,7 @@ pub struct ExecutionRecord {
 pub enum ActionKind {
     Move,
     Trash,
+    ScanAppSupportingFiles,
     UndoMove,
     UndoTrash,
 }
@@ -56,6 +60,7 @@ impl ActionKind {
         match self {
             Self::Move => "move",
             Self::Trash => "trash",
+            Self::ScanAppSupportingFiles => "scan_app_supporting_files",
             Self::UndoMove => "undo_move",
             Self::UndoTrash => "undo_trash",
         }
@@ -78,6 +83,7 @@ pub enum ExecutionStatus {
     Failed,
     Deduped,
     Trashed,
+    Scanned,
     Undone,
 }
 
@@ -85,7 +91,7 @@ impl ExecutionStatus {
     fn is_terminal_log_status(&self) -> bool {
         matches!(
             self,
-            Self::Moved | Self::Failed | Self::Trashed | Self::Undone
+            Self::Moved | Self::Failed | Self::Trashed | Self::Scanned | Self::Undone
         )
     }
 }
@@ -109,6 +115,8 @@ struct ActionLogRecord {
     #[serde(default)]
     trash_time_deleted: Option<i64>,
     reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    supporting_files: Vec<PathBuf>,
 }
 
 struct ActionLogRecordInput<'a> {
@@ -170,6 +178,7 @@ fn planned_record(
             rule_id: plan.rule_id.clone(),
             sha256: None,
             size: None,
+            supporting_files: Vec::new(),
         }),
         PlannedAction::Trash { .. } => Ok(ExecutionRecord {
             action: ActionKind::Trash,
@@ -180,6 +189,18 @@ fn planned_record(
             rule_id: plan.rule_id.clone(),
             sha256: None,
             size: None,
+            supporting_files: Vec::new(),
+        }),
+        PlannedAction::ScanAppSupportingFiles { .. } => Ok(ExecutionRecord {
+            action: ActionKind::ScanAppSupportingFiles,
+            source: plan.source.clone(),
+            destination: None,
+            status: ExecutionStatus::Planned,
+            reason: Some("would scan for macOS app supporting files".to_string()),
+            rule_id: plan.rule_id.clone(),
+            sha256: None,
+            size: None,
+            supporting_files: Vec::new(),
         }),
     }
 }
@@ -193,6 +214,9 @@ fn execute_action(
     match action {
         PlannedAction::Move { to, conflict, .. } => execute_move(plan, to, *conflict, options, log),
         PlannedAction::Trash { .. } => execute_trash(plan, options, log),
+        PlannedAction::ScanAppSupportingFiles { .. } => {
+            execute_scan_app_supporting_files(plan, options, log)
+        }
     }
 }
 
@@ -228,6 +252,7 @@ fn execute_move(
                 rule_id: plan.rule_id.clone(),
                 sha256: None,
                 size: Some(source_facts.size()),
+                supporting_files: Vec::new(),
             });
         }
         ConflictPolicy::Review if requested_destination.exists() => {
@@ -240,6 +265,7 @@ fn execute_move(
                 rule_id: plan.rule_id.clone(),
                 sha256: None,
                 size: Some(source_facts.size()),
+                supporting_files: Vec::new(),
             });
         }
         _ => {}
@@ -297,6 +323,7 @@ fn execute_move(
         rule_id: plan.rule_id.clone(),
         sha256: Some(sha256),
         size: Some(size),
+        supporting_files: Vec::new(),
     })
 }
 
@@ -381,6 +408,61 @@ fn execute_trash(
         rule_id: plan.rule_id.clone(),
         sha256: None,
         size: Some(size),
+        supporting_files: Vec::new(),
+    })
+}
+
+fn execute_scan_app_supporting_files(
+    plan: &ActionPlan,
+    options: &ExecuteOptions,
+    log: &mut ActionLog,
+) -> Result<ExecutionRecord, ExecuteError> {
+    let source = plan
+        .source
+        .canonicalize()
+        .map_err(|error| ExecuteError::io("canonicalize app bundle source", &plan.source, error))?;
+    let scan = scan_app_supporting_files(&source)?;
+    let supporting_files = scan.candidate_paths;
+    let reason = if supporting_files.is_empty() {
+        Some(format!(
+            "no candidate macOS app supporting files found for {}",
+            scan.bundle_identifier
+        ))
+    } else {
+        Some(format!(
+            "candidate macOS app supporting files for {}",
+            scan.bundle_identifier
+        ))
+    };
+
+    let action_id = new_action_id();
+    let mut record = ActionLogRecord::new(ActionLogRecordInput {
+        action_id,
+        undoes_action_id: None,
+        run_id: &options.run_id,
+        rule_id: &plan.rule_id,
+        action: ActionKind::ScanAppSupportingFiles,
+        status: ExecutionStatus::Scanned,
+        from: &source,
+        to: None,
+        sha256: None,
+        size: None,
+        trash_time_deleted: None,
+        reason: reason.clone(),
+    });
+    record.supporting_files = supporting_files.clone();
+    log.append(&record)?;
+
+    Ok(ExecutionRecord {
+        action: ActionKind::ScanAppSupportingFiles,
+        source,
+        destination: None,
+        status: ExecutionStatus::Scanned,
+        reason,
+        rule_id: plan.rule_id.clone(),
+        sha256: None,
+        size: None,
+        supporting_files,
     })
 }
 
@@ -444,6 +526,7 @@ fn dedupe_if_same_hash(
         rule_id: plan.rule_id.clone(),
         sha256: Some(source_hash),
         size: Some(source_facts.size()),
+        supporting_files: Vec::new(),
     })
 }
 
@@ -1019,6 +1102,7 @@ impl ActionLogRecord {
             size,
             trash_time_deleted,
             reason,
+            supporting_files: Vec::new(),
         }
     }
 }
@@ -1135,6 +1219,8 @@ pub enum ExecuteError {
     TrashRestore(#[source] trash::Error),
     #[error(transparent)]
     FileFact(#[from] FileFactError),
+    #[error(transparent)]
+    AppSupport(#[from] crate::app_support::AppSupportError),
     #[error("failed to {op} for {}: {source}", path.display())]
     Io {
         op: &'static str,
@@ -1180,6 +1266,10 @@ mod tests {
             r#""trash""#
         );
         assert_eq!(
+            serde_json::to_string(&ActionKind::ScanAppSupportingFiles).unwrap(),
+            r#""scan_app_supporting_files""#
+        );
+        assert_eq!(
             serde_json::from_str::<ActionKind>(r#""move""#).unwrap(),
             ActionKind::Move
         );
@@ -1195,6 +1285,33 @@ mod tests {
             serde_json::from_str::<ActionKind>(r#""trash""#).unwrap(),
             ActionKind::Trash
         );
+        assert_eq!(
+            serde_json::from_str::<ActionKind>(r#""scan_app_supporting_files""#).unwrap(),
+            ActionKind::ScanAppSupportingFiles
+        );
+    }
+
+    #[test]
+    fn dry_run_scan_app_supporting_files_does_not_log() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let app = temp_dir.path().join("Example.app");
+        fs::create_dir(&app).unwrap();
+        let log = temp_dir.path().join("actions.jsonl");
+        let plan = scan_app_supporting_files_plan(&app);
+
+        let report = execute_plan(&plan, &options(true, temp_dir.path(), &log)).unwrap();
+
+        assert_eq!(report.records[0].action, ActionKind::ScanAppSupportingFiles);
+        assert_eq!(report.records[0].status, ExecutionStatus::Planned);
+        assert!(
+            report.records[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("would scan")
+        );
+        assert!(report.records[0].supporting_files.is_empty());
+        assert!(!log.exists());
     }
 
     #[test]
@@ -1756,6 +1873,17 @@ mod tests {
             variables: IndexMap::new(),
             extraction_diagnostics: Vec::new(),
             actions: vec![PlannedAction::Trash { terminal: true }],
+        }
+    }
+
+    fn scan_app_supporting_files_plan(source: &Path) -> ActionPlan {
+        ActionPlan {
+            source: source.to_path_buf(),
+            rule_id: "rule".to_string(),
+            rule_name: None,
+            variables: IndexMap::new(),
+            extraction_diagnostics: Vec::new(),
+            actions: vec![PlannedAction::ScanAppSupportingFiles { terminal: true }],
         }
     }
 
