@@ -615,14 +615,6 @@ fn destination_path_error(error: PathError, original: &Path) -> ExecuteError {
 }
 
 fn ensure_destination_in_roots(destination: &Path, roots: &[PathBuf]) -> Result<(), ExecuteError> {
-    let canonical_roots = roots
-        .iter()
-        .map(|root| {
-            root.canonicalize()
-                .map_err(|error| ExecuteError::io("canonicalize destination root", root, error))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
     let parent = destination
         .parent()
         .ok_or_else(|| ExecuteError::UnsafeDestination(destination.to_path_buf()))?;
@@ -631,6 +623,27 @@ fn ensure_destination_in_roots(destination: &Path, roots: &[PathBuf]) -> Result<
     let canonical_existing = existing_parent.canonicalize().map_err(|error| {
         ExecuteError::io("canonicalize destination parent", &existing_parent, error)
     })?;
+
+    let mut canonical_roots = Vec::new();
+    for root in roots {
+        match root.canonicalize() {
+            Ok(root) => canonical_roots.push(root),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ExecuteError::io(
+                    "canonicalize destination root",
+                    root,
+                    error,
+                ));
+            }
+        }
+    }
+
+    if canonical_roots.is_empty() {
+        return Err(ExecuteError::DestinationRootsUnavailable {
+            roots: roots.to_vec(),
+        });
+    }
 
     if canonical_roots
         .iter()
@@ -1196,6 +1209,8 @@ pub enum ExecuteError {
         destination: PathBuf,
         roots: Vec<PathBuf>,
     },
+    #[error("none of the configured destination roots are currently available: {roots:?}")]
+    DestinationRootsUnavailable { roots: Vec<PathBuf> },
     #[error("destination {} already exists", .0.display())]
     DestinationExists(PathBuf),
     #[error("could not find append-counter destination for {}", .0.display())]
@@ -1509,6 +1524,60 @@ mod tests {
         assert!(matches!(
             error,
             ExecuteError::DestinationOutsideRoots { .. }
+        ));
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn missing_unrelated_destination_root_does_not_block_move() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.pdf");
+        let dest_root = temp_dir.path().join("dest");
+        let missing_root = temp_dir.path().join("missing");
+        fs::create_dir(&dest_root).unwrap();
+        fs::write(&source, b"abc").unwrap();
+        let destination = dest_root.join("source.pdf");
+        let log = temp_dir.path().join("actions.jsonl");
+        let mut execute_options = options(false, &dest_root, &log);
+        execute_options.destination_roots.push(missing_root);
+
+        let report = execute_plan(
+            &plan(&source, &destination, ConflictPolicy::Error),
+            &execute_options,
+        )
+        .unwrap();
+
+        assert_eq!(report.records[0].status, ExecutionStatus::Moved);
+        assert_eq!(fs::read(destination).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn destination_under_missing_root_is_not_allowed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let source = temp_dir.path().join("source.pdf");
+        let missing_root = temp_dir.path().join("missing");
+        fs::write(&source, b"abc").unwrap();
+        let log = temp_dir.path().join("actions.jsonl");
+        let execute_options = ExecuteOptions {
+            dry_run: false,
+            destination_roots: vec![missing_root.clone()],
+            action_log_path: log,
+            run_id: "test-run".to_string(),
+        };
+
+        let error = execute_plan(
+            &plan(
+                &source,
+                &missing_root.join("source.pdf"),
+                ConflictPolicy::Error,
+            ),
+            &execute_options,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ExecuteError::DestinationRootsUnavailable { .. }
         ));
         assert!(source.exists());
     }
