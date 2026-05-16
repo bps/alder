@@ -385,6 +385,7 @@ pub fn watchman_check(
 }
 
 fn run_watchman_json(command: impl Serialize) -> Result<Value, WatchmanError> {
+    let command = serde_json::to_value(command).map_err(WatchmanError::JsonShape)?;
     let mut child = Command::new("watchman")
         .arg("-j")
         .stdin(Stdio::piped())
@@ -408,16 +409,78 @@ fn run_watchman_json(command: impl Serialize) -> Result<Value, WatchmanError> {
         .wait_with_output()
         .map_err(|error| WatchmanError::io("wait for watchman", "watchman", error))?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if is_watchman_permission_error(&stderr) {
+            return Err(classify_watchman_error(&command, stderr));
+        }
         return Err(WatchmanError::CommandFailed {
             status: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stderr,
         });
     }
     let value: Value = serde_json::from_slice(&output.stdout)?;
     if let Some(error) = value.get("error").and_then(Value::as_str) {
-        return Err(WatchmanError::Watchman(error.to_string()));
+        return Err(classify_watchman_error(&command, error.to_string()));
     }
     Ok(value)
+}
+
+fn classify_watchman_error(command: &Value, message: String) -> WatchmanError {
+    if is_watchman_permission_error(&message) {
+        return WatchmanError::WatchmanPermission {
+            command: watchman_command_name(command).unwrap_or_else(|| "watchman".to_string()),
+            root: permission_error_root(command, &message)
+                .unwrap_or_else(|| "the requested watch root".to_string()),
+            message,
+            guidance: watchman_permission_guidance(),
+        };
+    }
+
+    WatchmanError::Watchman(message)
+}
+
+fn is_watchman_permission_error(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("operation not permitted")
+}
+
+fn watchman_command_name(command: &Value) -> Option<String> {
+    command.as_array()?.first()?.as_str().map(ToOwned::to_owned)
+}
+
+fn permission_error_root(command: &Value, message: &str) -> Option<String> {
+    root_from_realpath_error(message)
+        .or_else(|| root_from_unable_to_resolve_error(message))
+        .or_else(|| root_from_command(command))
+}
+
+fn root_from_realpath_error(message: &str) -> Option<String> {
+    let start = message.find("realpath(")? + "realpath(".len();
+    let rest = &message[start..];
+    let end = rest.find(") -> Operation not permitted")?;
+    Some(rest[..end].to_string())
+}
+
+fn root_from_unable_to_resolve_error(message: &str) -> Option<String> {
+    let start = message.find("unable to resolve root ")? + "unable to resolve root ".len();
+    let rest = &message[start..];
+    let end = rest.find(':')?;
+    Some(rest[..end].to_string())
+}
+
+fn root_from_command(command: &Value) -> Option<String> {
+    command.as_array()?.get(1)?.as_str().map(ToOwned::to_owned)
+}
+
+#[cfg(target_os = "macos")]
+fn watchman_permission_guidance() -> &'static str {
+    "On macOS, this usually means Watchman needs Files and Folders or Full Disk Access re-approval. Re-approve the watchman executable (for Homebrew, usually /opt/homebrew/bin/watchman), then run `watchman shutdown-server` and `alder watchman sync`. Restarting Watchman affects all tools using this Watchman daemon."
+}
+
+#[cfg(not(target_os = "macos"))]
+fn watchman_permission_guidance() -> &'static str {
+    "Check the watched path permissions and restart Watchman before running `alder watchman sync` again."
 }
 
 fn path_value(path: &Path) -> Value {
@@ -442,6 +505,13 @@ pub enum WatchmanError {
     UnsafeWatchmanName(String),
     #[error("watchman error: {0}")]
     Watchman(String),
+    #[error("Watchman cannot access {root} while running `{command}`: {message}\n{guidance}")]
+    WatchmanPermission {
+        command: String,
+        root: String,
+        message: String,
+        guidance: &'static str,
+    },
     #[error("Watchman trigger drift for {}: {message}", root.display())]
     TriggerDrift { root: PathBuf, message: String },
     #[error("unexpected Watchman response: {0}")]
@@ -645,6 +715,32 @@ rules:
         let error = parse_watchman_stdin(input, "/watch/root", watch).unwrap_err();
 
         assert!(matches!(error, WatchmanError::UnsafeWatchmanName(_)));
+    }
+
+    #[test]
+    fn classifies_watchman_operation_not_permitted_errors() {
+        let command = json!(["trigger-list", "/Users/example/Downloads"]);
+        let message = "watchman::RootResolveError: failed to resolve root: unable to resolve root /Users/example/Downloads: failed to resolve root: realpath(/Users/example/Downloads) -> Operation not permitted".to_string();
+
+        let error = classify_watchman_error(&command, message);
+
+        match error {
+            WatchmanError::WatchmanPermission { command, root, .. } => {
+                assert_eq!(command, "trigger-list");
+                assert_eq!(root, "/Users/example/Downloads");
+            }
+            other => panic!("expected WatchmanPermission, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn leaves_non_permission_watchman_errors_generic() {
+        let command = json!(["trigger-list", "/Users/example/Downloads"]);
+        let message = "trigger is missing".to_string();
+
+        let error = classify_watchman_error(&command, message.clone());
+
+        assert!(matches!(error, WatchmanError::Watchman(value) if value == message));
     }
 
     fn config_with_ignore(ignore: &str) -> Config {
